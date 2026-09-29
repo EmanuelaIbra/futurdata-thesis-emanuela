@@ -422,6 +422,7 @@ def _to_component(
         weight=_parse_weight(node.weight),
         weight_unit=node.weight_unit,
         material=node.material,
+        material_details=node.extra.get("material_details", {}),
         color=node.color,
         image_path=node.image_path,
         kept_whole=kept_whole,

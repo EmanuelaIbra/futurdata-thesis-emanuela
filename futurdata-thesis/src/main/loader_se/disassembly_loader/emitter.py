@@ -97,6 +97,7 @@ def _component_to_dict(c: Component) -> dict[str, Any]:
         "weight": c.weight,
         "weight_unit": c.weight_unit,
         "material": c.material,
+        "material_details": c.material_details,
         "color": c.color,
         "image": _image_to_dict(c.image_path),
         "kept_whole": c.kept_whole,

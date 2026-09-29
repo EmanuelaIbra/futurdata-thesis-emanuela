@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import json
 import os
+import warnings
 from typing import Any
 
 from .models import (
@@ -122,6 +123,22 @@ def normalize(raw: dict[str, Any], source_path: str | None = None) -> Disassembl
     Defects in the graph (dangling edges, cycles, etc.) are preserved, not
     rejected — the validator handles them later.
     """
+    # Resolve only explicit portable catalog definitions; local numeric IDs have
+    # no universal meaning and must never be printed as material/color names.
+    import copy
+    raw = copy.deepcopy(raw)
+    catalogs = raw.get("catalogs", raw.get("repository", {}).get("catalogs", raw.get("repository", {})))
+    for item in raw.get("shapes", []) if isinstance(raw.get("shapes"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        for label, field, collection in (("material", "material_id", "materials"), ("color", "color_id", "colors")):
+            record = next((r for r in catalogs.get(collection, []) if str(r.get("id")) == str(item.get(field))), None)
+            if item.get(field) is not None and not record and not item.get(label):
+                warnings.warn(f"Unresolved {field}={item[field]}; portable catalog definition missing", RuntimeWarning)
+            if record:
+                item[label] = record.get("name")
+                if label == "material":
+                    item["material_details"] = {k:record.get(k) for k in ("category_name", "subcategory_name", "type_name", "scientific_name", "technical_name", "surface")}
     shapes = raw.get("shapes")
     if shapes is None:
         raise UnparsableModelError("Model is missing the required 'shapes' key.")
@@ -287,8 +304,8 @@ def _build_node(shape: dict[str, Any]) -> GraphNode:
     # material/color: sources carry either an id (material_id/color_id) or a
     # name. We keep whatever is present as a string; resolving ids to names is
     # out of scope for the load phase.
-    material = _first_present(shape, ("material", "material_id"))
-    color = _first_present(shape, ("color", "color_id"))
+    material = _first_present(shape, ("material",))
+    color = _first_present(shape, ("color",))
 
     # tools: kept as the raw string the source gives (actions carry individual
     # tools, diamonds carry a comma-separated aggregate — verified on Bialetti/

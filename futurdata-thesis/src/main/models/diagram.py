@@ -1,11 +1,13 @@
 from typing import List, Optional, Tuple
 from datetime import datetime
+from uuid import uuid4
 from .shape import Shape
 from .connection import Connection
 
 
 class Diagram:
     def __init__(self):
+        self.diagram_id = str(uuid4())
         self.shapes: List[Shape] = []
         self.connections: List[Connection] = []
         self.selected_shapes: List[Shape] = []
@@ -96,6 +98,7 @@ class Diagram:
         ]
 
     def clear(self):
+        self.diagram_id = str(uuid4())
         self.shapes.clear()
         self.connections.clear()
         self.selected_shapes.clear()
@@ -116,6 +119,7 @@ class Diagram:
     def to_dict(self) -> dict:
         self.metadata["modified"] = datetime.now().isoformat()
         return {
+            "diagram_id": self.diagram_id,
             "metadata": self.metadata,
             "diagram": {
                 "canvas_size": self.canvas_size,
@@ -130,6 +134,7 @@ class Diagram:
     @staticmethod
     def from_dict(data: dict) -> 'Diagram':
         diagram = Diagram()
+        diagram.diagram_id = data.get("diagram_id") or diagram.diagram_id
         diagram.metadata = data.get("metadata", diagram.metadata)
         diagram_data = data.get("diagram", {})
         canvas_size_data = diagram_data.get("canvas_size")

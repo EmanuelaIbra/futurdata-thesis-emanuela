@@ -4,6 +4,8 @@ from typing import Optional, Tuple
 import os
 
 from ..models import Diagram, ActionCircle, DiamondStep, ComponentBox, ArrowShape, Connection
+import copy
+from uuid import uuid4
 from ..repositories import get_repository, DuplicateValueError
 from ..services import ProjectArchiveService
 from .catalog_controller import CatalogController
@@ -363,7 +365,7 @@ class AppController:
         self._sync_connection(from_shape, to_shape)
         self._update_view()
 
-    def _sync_connection(self, from_shape, to_shape):
+    def _sync_connection(self, from_shape, to_shape, strict=False):
         """Persist key canvas relationships to storage."""
         try:
             # Component -> Circle defines step input.
@@ -422,13 +424,20 @@ class AppController:
             # Ignore duplicate links constrained by unique indexes.
             pass
         except Exception as exc:
+            if strict:
+                raise
             self.view.set_status(f"storage sync warning: {exc}")
 
     def _ensure_component_id(self, shape: ComponentBox) -> Optional[int]:
         """Return the component's storage id, creating the storage row if needed."""
         db_id = shape.properties.get("db_id")
         if db_id:
-            return int(db_id)
+            row = self.repository.get_component(int(db_id))
+            if isinstance(row, dict) and row.get("diagram_id") != self.diagram.diagram_id:
+                raise ValueError("Component belongs to another diagram")
+            if row:
+                return int(db_id)
+            shape.properties["db_id"] = None
 
         node_type = str(shape.properties.get("node_type", "Intermediate")).strip() or "Intermediate"
         node_type = node_type.capitalize()
@@ -444,29 +453,11 @@ class AppController:
         weight_unit = shape.properties.get("weight_unit") or "g"
 
         if node_type == "Root":
-            # Check if root component with this name already exists
-            existing = self._find_existing_root_component(name)
-            if existing:
-                # Update existing instead of creating new
-                comp_id = existing['id']
-                self.repository.update_component(
-                    comp_id,
-                    name=name,
-                    color_id=color_id,
-                    material_id=material_id,
-                    weight=weight,
-                    weight_unit=weight_unit,
-                    node_type="Root"
-                )
-            else:
-                comp_id = self.repository.create_component(
-                    name=name,
-                    color_id=color_id,
-                    material_id=material_id,
-                    weight=weight,
-                    weight_unit=weight_unit,
-                    node_type="Root",
-                )
+            comp_id = self.repository.create_component(
+                name=name, color_id=color_id, material_id=material_id,
+                weight=weight, weight_unit=weight_unit, node_type="Root",
+                diagram_id=self.diagram.diagram_id,
+            )
         else:
             root_component_id = self._get_root_component_id()
             if root_component_id is None:
@@ -506,7 +497,14 @@ class AppController:
             input_shape = self._resolve_input_shape_for_step(step_shape)
 
         if step_id:
-            return int(step_id)
+            row = self.repository.get_step(int(step_id))
+            if isinstance(row, dict) and row.get("diagram_id") != self.diagram.diagram_id:
+                raise ValueError("Step belongs to another diagram")
+            if row:
+                if input_shape is not None:
+                    self.repository.update_step(int(step_id), component_id=self._ensure_component_id(input_shape))
+                return int(step_id)
+            step_shape.db_step_id = None
 
         if input_shape is None:
             for shape in self.diagram.shapes:
@@ -542,6 +540,9 @@ class AppController:
             if conn.to_shape == step_shape and isinstance(conn.from_shape, ComponentBox):
                 return conn.from_shape
 
+        for arrow in self.diagram.shapes:
+            if isinstance(arrow, ArrowShape) and arrow.to_shape == step_shape and isinstance(arrow.from_shape, ComponentBox):
+                return arrow.from_shape
         for shape in self.diagram.shapes:
             if isinstance(shape, ComponentBox) and str(shape.properties.get("node_type", "")).strip().lower() == "root":
                 return shape
@@ -551,11 +552,19 @@ class AppController:
         """Return the action's storage id, creating the storage row if needed."""
         action_id = getattr(action_shape, "db_action_id", None)
         if action_id:
-            return int(action_id)
+            row = self.repository.get_action(int(action_id))
+            if isinstance(row, dict) and row.get("diagram_id") != self.diagram.diagram_id:
+                raise ValueError("Action belongs to another diagram")
+            if row:
+                return int(action_id)
+            action_shape.db_action_id = None
 
         action_name = str(action_shape.name or action_shape.text or "Action").strip()
         tool_val = str(action_shape.tools or "").strip()
-        action_id = self.repository.create_action(name=action_name, description="", tool_id=None)
+        root_id = self._get_root_component_id()
+        if root_id is None:
+            raise ValueError("Add a root component before saving actions")
+        action_id = self.repository.create_action(name=action_name, description="", tool_id=None, diagram_id=self.diagram.diagram_id)
         action_shape.db_action_id = action_id
         if action_shape.name:
             action_shape.text = action_shape.name
@@ -825,54 +834,46 @@ class AppController:
             self.view.set_status("Properties updated (saved to JSON storage)")
 
     def _persist_diagram(self):
-        """Flush current in-memory shapes to storage before file save/export."""
-        roots = []
-        others = []
-        for shape in self.diagram.shapes:
-            if isinstance(shape, ComponentBox) and str(shape.properties.get("node_type", "")).strip().lower() == "root":
-                roots.append(shape)
-            else:
-                others.append(shape)
-
-        # First, persist all shape properties
-        for shape in roots + others:
-            try:
-                self._persist_shape_properties(shape)
-            except Exception:
-                # Keep file save resilient; storage sync for relationships is handled separately.
-                continue
-        
-        # Then, sync all connections to JSON storage
-        for conn in self.diagram.connections:
-            try:
-                self._sync_connection(conn.from_shape, conn.to_shape)
-            except Exception:
-                continue
-        
-        # Also sync arrow shapes (which represent connections)
-        for shape in self.diagram.shapes:
-            if isinstance(shape, ArrowShape):
-                try:
-                    self._sync_connection(shape.from_shape, shape.to_shape)
-                except Exception:
-                    continue
+        """Atomically persist one owned diagram and its complete editable graph."""
+        roots = [s for s in self.diagram.shapes if isinstance(s, ComponentBox) and str(s.properties.get("node_type", "")).lower() == "root"]
+        if not self.diagram.shapes:
+            return
+        if len(roots) != 1:
+            raise ValueError("Saving requires exactly one root component")
+        # Roll back assigned model IDs as well as repository data after failure.
+        states = [(shape, copy.deepcopy(shape.properties) if isinstance(shape, ComponentBox) else
+                   {key:getattr(shape, key, None) for key in ("db_step_id", "db_action_id", "db_step_action_id", "db_action_order", "tool_id")})
+                  for shape in self.diagram.shapes]
+        old_product = self.current_product_id
+        try:
+            with self.repository.transaction():
+                for shape in roots + [s for s in self.diagram.shapes if s not in roots]:
+                    self._persist_shape_properties(shape)
+                self.repository.save_diagram_snapshot(self.diagram.diagram_id, self.diagram.to_dict())
+        except Exception:
+            self.current_product_id = old_product
+            for shape, state in states:
+                if isinstance(shape, ComponentBox):
+                    shape.properties = state
+                else:
+                    for key, value in state.items():
+                        setattr(shape, key, value)
+            raise
+        self.diagram.modified = False
 
     def _persist_shape_properties(self, shape):
         """Persist edited shape properties through the JSON repository."""
         if isinstance(shape, ComponentBox):
             component_id = self._ensure_component_id(shape)
             updates = dict(shape.properties)
-            for internal_key in ("db_id", "_material_category_id", "_material_subcategory_id", "_material_type_id"):
+            for internal_key in ("db_id", "root_component_id", "diagram_id", "_material_category_id", "_material_subcategory_id", "_material_type_id"):
                 updates.pop(internal_key, None)
             self.repository.update_component(int(component_id), **updates)
             shape.properties["db_id"] = int(component_id)
             return
 
         if isinstance(shape, ActionCircle):
-            try:
-                step_id = self._ensure_step_id(shape)
-            except ValueError:
-                return
+            step_id = self._ensure_step_id(shape)
             self.repository.update_step(
                 int(step_id), title=str(shape.text or "").strip(),
                 description=str(shape.step_description or "").strip(),
@@ -994,6 +995,7 @@ class AppController:
 
         diagram = DiagramSerializer.load_from_file(file_path)
         if diagram:
+            self._detach_imported_diagram(diagram)
             self.diagram = diagram
             self.command_history.clear()
             # Update canvas scroll region to fit loaded shapes
@@ -1064,6 +1066,7 @@ class AppController:
         # Reset canvas to minimum size
         self.view.canvas.update_scroll_region_from_shapes([])
         self._update_view()
+        self.current_product_id = None
         self.view.set_status("Canvas cleared")
 
     def check_unsaved_changes(self) -> bool:
@@ -1337,6 +1340,18 @@ class AppController:
     def export_presentation(self):
         return self.export_document("pptx")
 
+    def _detach_imported_diagram(self, diagram):
+        """An imported project is an independent copy, never a name-based merge."""
+        diagram.diagram_id = str(uuid4())
+        self.current_product_id = None
+        for shape in diagram.shapes:
+            if isinstance(shape, ComponentBox):
+                shape.properties["db_id"] = None
+            else:
+                for key in ("db_step_id", "db_action_id", "db_step_action_id", "db_action_order"):
+                    if hasattr(shape, key):
+                        setattr(shape, key, None)
+
     def import_diagram_enhanced(self):
         """Import a portable ARIADNE ZIP (diagram JSON + images)."""
         if not self.check_unsaved_changes():
@@ -1354,17 +1369,7 @@ class AppController:
             if not diagram:
                 self.view.show_error("Error", "Failed to import project")
                 return
-            # Imported projects become new JSON-storage entities; stale exported IDs are cleared.
-            for shape in diagram.shapes:
-                if isinstance(shape, ComponentBox):
-                    shape.properties["db_id"] = None
-                elif isinstance(shape, ActionCircle):
-                    shape.db_step_id = None
-                elif isinstance(shape, DiamondStep):
-                    shape.db_action_id = None
-                    shape.db_step_id = None
-                    shape.db_step_action_id = None
-                    shape.db_action_order = None
+            self._detach_imported_diagram(diagram)
             self.diagram = diagram
             self.diagram.file_path = None
             self.diagram.auto_sync_json = False
@@ -1373,6 +1378,9 @@ class AppController:
             self._persist_diagram()
             self.view.canvas.update_scroll_region_from_shapes(self.diagram.shapes)
             self._update_view()
+            notices = getattr(diagram, "import_warnings", [])
+            if notices:
+                self.view.show_error("Import warnings", "\n".join(notices))
             self.view.set_status(f"Imported project: {os.path.basename(file_path)}")
         except Exception as exc:
             self.view.show_error("Error", f"Import failed: {exc}")

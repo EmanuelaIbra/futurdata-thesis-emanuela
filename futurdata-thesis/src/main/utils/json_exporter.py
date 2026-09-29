@@ -7,6 +7,7 @@ import json
 import os
 from datetime import datetime
 from typing import Dict, Any, Optional
+from ..services.catalog_resolver import CatalogResolver
 from ..models import Diagram, ComponentBox, ActionCircle, DiamondStep, ArrowShape
 
 
@@ -30,12 +31,15 @@ class EnhancedJSONExporter:
         converters. PPTX, DOCX, Markdown, TXT and HTML therefore receive the same
         canonical graph without losing the visual arrow data.
         """
-        return {
+        snapshot = {
+            "diagram_id": diagram.diagram_id,
             "metadata": self._build_metadata(diagram, None),
             "diagram": self._build_diagram_settings(diagram),
             "shapes": self._export_shapes(diagram),
             "connections": self._export_connections(diagram, include_arrows=True),
         }
+
+        return CatalogResolver(self.repository).enrich(snapshot)
 
     def export_diagram(self, diagram: Diagram, file_path: str, 
                       product_id: Optional[int] = None, copy_images: bool = True) -> bool:
@@ -60,6 +64,7 @@ class EnhancedJSONExporter:
                 "repository": self._export_repository_info(diagram, product_id)
             }
             
+            data = CatalogResolver(self.repository).enrich(data)
             # Write to file
             with open(file_path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
@@ -207,6 +212,9 @@ class EnhancedJSONExporter:
                 "image_path": shape.properties.get('image_path', '')
             })
             
+            for field in ("material", "color", "material_details", "unresolved_image_path", "legacy_references"):
+                if field in shape.properties:
+                    base_data[field] = shape.properties[field]
             # Determine if it's a product
             if shape.properties.get('node_type') == 'Root':
                 base_data["type"] = "product"
@@ -329,7 +337,18 @@ class EnhancedJSONExporter:
         info["actions"] = [self.repository.get_action(action_id) for action_id in sorted(action_ids)]
         return info
 
-    def import_diagram(self, file_path: str, create_in_repository: bool = True) -> Optional[Diagram]:
+    def import_diagram(self, file_path: str, create_in_repository: bool = True):
+        from contextlib import nullcontext
+        try:
+            with self.repository.transaction() if self.repository is not None else nullcontext():
+                diagram = self._import_diagram(file_path, create_in_repository)
+                if diagram is None:
+                    raise ValueError("Invalid diagram import")
+                return diagram
+        except (OSError, ValueError, TypeError, KeyError):
+            return None
+
+    def _import_diagram(self, file_path: str, create_in_repository: bool = True) -> Optional[Diagram]:
         """
         Import diagram from JSON and optionally create in repository.
         
@@ -344,6 +363,17 @@ class EnhancedJSONExporter:
             with open(file_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             
+            catalog_warnings = []
+            catalogs = data.get("catalogs", data.get("repository", {}).get("catalogs", data.get("repository", {})))
+            references = [(shape, field, collection) for shape in data.get("shapes", []) for field, collection in (("color_id", "colors"), ("material_id", "materials"), ("tool_id", "tools")) if shape.get(field) is not None]
+            if references:
+                maps = self.repository.import_catalogs(catalogs)
+                for shape, field, collection in references:
+                    old = shape[field]
+                    shape[field] = maps.get(collection, {}).get(old)
+                    if shape[field] is None:
+                        catalog_warnings.append(f"Unresolved legacy {field}={old}; no portable definition")
+                        shape.setdefault("legacy_references", {})[field] = old
             # Create diagram
             diagram = Diagram()
             diagram.file_path = file_path
@@ -395,6 +425,7 @@ class EnhancedJSONExporter:
             
             # Restore images if available
             self._restore_diagram_images(diagram, file_path)
+            diagram.import_warnings.extend(catalog_warnings)
             
             return diagram
             
@@ -424,6 +455,9 @@ class EnhancedJSONExporter:
             shape.properties['weight_unit'] = data.get('weight_unit', 'g')
             shape.properties['description'] = data.get('description', '')
             shape.properties['image_path'] = data.get('image_path', '')
+            for field in ('material', 'color', 'material_details', 'unresolved_image_path', 'legacy_references'):
+                if field in data:
+                    shape.properties[field] = data[field]
             
             # If DB ID exists and not creating new, preserve it
             if data.get('db_id') and not create_in_repository:
@@ -474,70 +508,43 @@ class EnhancedJSONExporter:
         arrow.update_from_shapes()
         return arrow
     
-    def _restore_diagram_images(self, diagram: Diagram, json_file_path: str):
-        """Restore images from export folder to application images folder."""
-        try:
-            from .image_handler import get_image_handler
-            
-            # Check for images folder next to JSON
-            json_dir = os.path.dirname(json_file_path)
-            json_basename = os.path.splitext(os.path.basename(json_file_path))[0]
-            images_import_dir = os.path.join(json_dir, f"{json_basename}_images")
-            
-            # Also support portable use cases with a normal images/ folder.
-            if not os.path.isdir(images_import_dir):
-                images_import_dir = os.path.join(json_dir, 'images')
-            if not os.path.isdir(images_import_dir):
-                return
-            
-            image_handler = get_image_handler()
-            restored_count = 0
-            
-            # Process each shape and restore its image
-            for shape in diagram.shapes:
-                image_path = None
-                
-                if isinstance(shape, ComponentBox):
-                    image_path = shape.properties.get('image_path', '')
-                elif isinstance(shape, ActionCircle):
-                    image_path = getattr(shape, 'image_path', '')
-                elif isinstance(shape, DiamondStep):
-                    image_path = getattr(shape, 'image_path', '')
-                
-                if image_path:
-                    # Check if image exists in import folder
-                    filename = os.path.basename(image_path)
-                    source_path = os.path.join(images_import_dir, filename)
-                    if not os.path.isfile(source_path) and not os.path.isabs(image_path):
-                        source_path = os.path.join(json_dir, image_path)
-                    
-                    if os.path.exists(source_path):
-                        # Determine entity type for proper folder
-                        entity_type = "component"
-                        if isinstance(shape, ActionCircle):
-                            entity_type = "step"
-                        elif isinstance(shape, DiamondStep):
-                            entity_type = "action"
-                        
-                        # Use image handler to upload (which copies to proper folder)
-                        new_path = image_handler.upload_image(
-                            source_path, 
-                            entity_type,
-                            None  # No entity ID yet
-                        )
-                        
-                        if new_path:
-                            # Update shape with new path
-                            if isinstance(shape, ComponentBox):
-                                shape.properties['image_path'] = new_path
-                            elif isinstance(shape, ActionCircle):
-                                shape.image_path = new_path
-                            elif isinstance(shape, DiamondStep):
-                                shape.image_path = new_path
-                            
-                            restored_count += 1
-            
-            print(f"Restored {restored_count} images from {images_import_dir}")
-            
-        except (OSError, TypeError, ValueError):
-            return
+    def _restore_diagram_images(self, diagram, json_file_path):
+        """Resolve exact paths first; never guess among duplicate legacy basenames."""
+        from pathlib import Path
+        from .image_handler import get_image_handler
+        root = Path(json_file_path).parent.resolve()
+        folders = [root / "images", root / (Path(json_file_path).stem + "_images")]
+        handler = get_image_handler()
+        self.last_import_warnings = []
+        for shape in diagram.shapes:
+            props = shape.properties if isinstance(shape, ComponentBox) else None
+            ref = props.get("image_path", "") if props is not None else getattr(shape, "image_path", "")
+            if not ref:
+                continue
+            normalized = str(ref).replace("\\", "/")
+            exact = (root / normalized).resolve()
+            source = exact if root in exact.parents and exact.is_file() else None
+            if source is None:
+                matches = {p.resolve() for folder in folders if folder.is_dir()
+                           for p in folder.rglob("*") if p.is_file() and p.name == normalized.rsplit("/", 1)[-1]}
+                if len(matches) == 1:
+                    source = matches.pop()
+                else:
+                    reason = "Ambiguous" if matches else "Missing"
+                    self.last_import_warnings.append(f"{reason} image for {shape.text}: {ref}")
+            new_path = None
+            if source:
+                kind = "component" if props is not None else "step" if isinstance(shape, ActionCircle) else "action"
+                new_path = handler.upload_image(str(source), kind, None)
+                if not new_path:
+                    self.last_import_warnings.append(f"Could not restore image: {ref}")
+            # An unresolved archive path must not resolve to an unrelated local file.
+            if props is not None:
+                props["image_path"] = new_path or ""
+                if not new_path:
+                    props["unresolved_image_path"] = ref
+            else:
+                shape.image_path = new_path or ""
+                if not new_path:
+                    shape.unresolved_image_path = ref
+        diagram.import_warnings = list(self.last_import_warnings)

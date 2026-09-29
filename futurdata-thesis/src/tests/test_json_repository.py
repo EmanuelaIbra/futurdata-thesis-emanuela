@@ -21,7 +21,7 @@ def test_json_repository_persists_complete_relationships(tmp_path):
     assert reloaded.get_product(root)["name"] == "Coffee machine"
     assert reloaded.get_components_from_step(step)[0]["name"] == "Pump"
     assert reloaded.get_actions_for_step(step)[0]["action"]["name"] == "Unscrew"
-    assert json.loads(path.read_text(encoding="utf-8"))["schema_version"] == 1
+    assert json.loads(path.read_text(encoding="utf-8"))["schema_version"] == 2
 
 
 def test_export_is_zip_with_json_and_images_directory(tmp_path):

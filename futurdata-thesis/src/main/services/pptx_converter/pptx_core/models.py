@@ -83,6 +83,12 @@ def _labels(value: Any) -> list[str]:
     return values
 
 
+def _material_text(name, details):
+    parts = [str(name)] if name else []
+    parts.extend(f"{k.replace('_name', '').replace('_', ' ').title()}: {v}" for k,v in (details or {}).items() if v is not None and str(v).strip())
+    return "; ".join(parts) or None
+
+
 @dataclass(slots=True)
 class Component:
     node_id: int | str | None
@@ -115,7 +121,7 @@ class Component:
             weight=data.get("weight"),
             weight_unit=data.get("weight_unit"),
             measured_weight=data.get("measured_weight", data.get("actual_weight")),
-            material=data.get("material"),
+            material=_material_text(data.get("material"), data.get("material_details")),
             color=data.get("color"),
             quality=data.get("quality", data.get("grading")),
             destination=data.get("destination"),

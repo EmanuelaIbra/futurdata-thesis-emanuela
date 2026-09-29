@@ -39,7 +39,8 @@ class Shape:
             "type": self.shape_type,
             "x": self.x,
             "y": self.y,
-            "text": self.text
+            "text": self.text,
+            **{key:getattr(self, key) for key in ("db_step_id", "db_action_id", "db_step_action_id", "db_action_order", "unresolved_image_path") if hasattr(self, key)}
         }
 
     @staticmethod
@@ -69,6 +70,9 @@ class Shape:
 
         shape.id = data["id"]
         shape.text = data.get("text", "")
+        for key in ("db_step_id", "db_action_id", "db_step_action_id", "db_action_order", "unresolved_image_path"):
+            if key in data:
+                setattr(shape, key, data[key])
 
         if hasattr(shape, 'load_properties'):
             shape.load_properties(data)

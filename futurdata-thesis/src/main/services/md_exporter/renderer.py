@@ -33,6 +33,7 @@ drawn to the risk.
 from __future__ import annotations
 
 import re
+from ...utils.material_display import material_text
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -160,7 +161,7 @@ def _render_header(
     if product.weight is not None:
         facts.append(f"**Total weight:** {md.format_weight(product.weight, product.weight_unit)}")
     if product.material:
-        facts.append(f"**Material:** {md.escape_md(product.material)}")
+        facts.append(f"**Material:** {md.escape_md(material_text(product.material, product.material_details))}")
     if guide.depth is not None:
         facts.append(f"**Disassembly depth:** `{guide.depth.mode.value}`")
     facts.append(f"**Steps:** {len(guide.steps)}")
@@ -216,7 +217,7 @@ def _render_bom(guide: Guide) -> list[str]:
         rows.append([
             name,
             md.format_weight(c.weight, c.weight_unit),
-            md.escape_cell(c.material) or "—",
+            md.escape_cell(material_text(c.material, c.material_details)) or "—",
             md.escape_cell(c.color) or "—",
         ])
     lines += md.table(["Component", "Weight", "Material", "Color"], rows)
@@ -300,7 +301,7 @@ def _render_part_line(part: Component) -> str:
     if part.weight is not None:
         details.append(md.format_weight(part.weight, part.weight_unit))
     if part.material:
-        details.append(md.escape_md(part.material))
+        details.append(md.escape_md(material_text(part.material, part.material_details)))
     if part.color:
         details.append(md.escape_md(part.color))
     if details:

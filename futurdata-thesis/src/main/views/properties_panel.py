@@ -317,6 +317,7 @@ class PropertiesPanel(ttk.Frame):
 
     def _setup_material_hierarchy_widget(self, widget):
         """Configure category/subcategory/type controls for component material selection."""
+        widget.selected_material_id = None
         categories = self.repository.get_all_material_categories()
         widget.category_map = {c["name"]: c["id"] for c in categories}
         widget.category_map_reverse = {c["id"]: c["name"] for c in categories}
@@ -335,7 +336,8 @@ class PropertiesPanel(ttk.Frame):
             self._setup_material_hierarchy_widget(widget)
             return
 
-        category_name = material.get("category_name") or ""
+        widget.selected_material_id = material_id
+        category_name = material.get("category_name") or (material.get("name") if material.get("name") in widget.category_map else "")
         widget.category_var.set(category_name)
         self._refresh_material_subcategories(widget, material.get("subcategory_id"))
         self._refresh_material_types(widget, material.get("type_id"))
@@ -385,11 +387,13 @@ class PropertiesPanel(ttk.Frame):
 
     def _on_material_category_changed(self, widget):
         """When category changes, refresh dependent fields."""
+        widget.selected_material_id = None
         self._refresh_material_subcategories(widget)
         self._refresh_material_types(widget)
 
     def _on_material_subcategory_changed(self, widget):
         """When subcategory changes, refresh type field."""
+        widget.selected_material_id = None
         self._refresh_material_types(widget)
 
     def _get_selected_material_id(self, widget):
@@ -398,24 +402,16 @@ class PropertiesPanel(ttk.Frame):
         subcategory_id = widget.subcategory_map.get(widget.subcategory_var.get()) if widget.subcategory_var.get() else None
         type_id = widget.type_map.get(widget.type_var.get()) if widget.type_var.get() else None
 
+        selected_id = getattr(widget, "selected_material_id", None)
+        selected = widget.material_data.get(selected_id) if selected_id else None
+        if selected:
+            selected_category = selected.get("category_id") or widget.category_map.get(selected.get("name"))
+            if (selected_category, selected.get("subcategory_id"), selected.get("type_id")) == (category_id, subcategory_id, type_id):
+                return selected_id
         if not category_id:
-            return None
+            return selected_id
 
-        if type_id:
-            for material in widget.material_rows:
-                if material.get("type_id") == type_id:
-                    return material.get("id")
-            return None
-
-        for material in widget.material_rows:
-            if material.get("category_id") != category_id:
-                continue
-            if subcategory_id and material.get("subcategory_id") != subcategory_id:
-                continue
-            if material.get("type_id") is None:
-                return material.get("id")
-
-        return None
+        return self.repository.resolve_material_selection(category_id, subcategory_id, type_id)
 
     def _load_component_properties(self, shape: ComponentBox):
         """Load component properties dynamically from JSON schema."""

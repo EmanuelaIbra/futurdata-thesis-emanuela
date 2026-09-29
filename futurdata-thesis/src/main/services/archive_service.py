@@ -24,8 +24,8 @@ class ProjectArchiveService:
         """Export *diagram* as ``diagram.json`` plus its available images.
 
         ``product_id`` is accepted for backwards compatibility, but is
-        intentionally ignored: exporting must not read from or write to the
-        application's internal repository.
+        intentionally ignored: exporting does not write application data. Referenced catalogs
+        are resolved read-only for portability.
 
         Missing referenced images are skipped and recorded in
         ``last_export_warnings``.  Real export errors are allowed to propagate
@@ -38,38 +38,31 @@ class ProjectArchiveService:
             target = target.with_suffix(".zip")
         target.parent.mkdir(parents=True, exist_ok=True)
 
-        # Build the JSON only from the in-memory diagram.  No repository call.
+        # The graph comes from memory; catalog definitions are resolved read-only.
         data = self.exporter.serialize_active_diagram(diagram)
 
         handler = get_image_handler()
+        import hashlib
+        assets = {}
+        for shape in data["shapes"]:
+            ref = shape.get("image_path")
+            if not ref:
+                continue
+            source = Path(handler.get_full_path(ref))
+            if not source.is_file():
+                self.last_export_warnings.append(f"Missing image skipped: {ref}")
+                continue
+            content = source.read_bytes()
+            # Portable paths are content-addressed, including absolute/legacy inputs.
+            arcname = f"images/{hashlib.sha256(content).hexdigest()}{source.suffix.lower()}"
+            if arcname in assets and assets[arcname] != content:
+                raise ValueError("Conflicting image contents for archive path")
+            assets[arcname] = content
+            shape["image_path"] = arcname
         with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr(
-                "diagram.json",
-                json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8"),
-            )
-
-            seen: set[str] = set()
-            for image_path in self._referenced_image_paths(diagram):
-                full_path = Path(handler.get_full_path(image_path))
-                if not full_path.is_file():
-                    self.last_export_warnings.append(
-                        f"Missing image skipped: {image_path}"
-                    )
-                    continue
-
-                # Keep the path used by diagram.json so import can restore it.
-                normalized = str(image_path).replace("\\", "/")
-                if normalized.startswith("images/"):
-                    relative = normalized[len("images/"):]
-                else:
-                    relative = full_path.name
-                relative = relative.lstrip("/")
-                arcname = f"images/{relative}"
-
-                if arcname in seen:
-                    continue
-                zf.write(full_path, arcname)
-                seen.add(arcname)
+            zf.writestr("diagram.json", json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8"))
+            for arcname, content in assets.items():
+                zf.writestr(arcname, content)
 
         return True
 
@@ -105,16 +98,6 @@ class ProjectArchiveService:
                 json_path = temp_dir / "diagram.json"
                 if not json_path.exists():
                     return None
-
-                images_dir = temp_dir / "images"
-                if images_dir.exists():
-                    for source in images_dir.rglob("*"):
-                        if not source.is_file():
-                            continue
-                        rel = source.relative_to(images_dir)
-                        dest = Path(handler.images_dir) / rel
-                        dest.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(source, dest)
 
                 return self.exporter.import_diagram(
                     str(json_path), create_in_repository=False

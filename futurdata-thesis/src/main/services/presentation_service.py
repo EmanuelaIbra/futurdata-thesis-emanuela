@@ -2,7 +2,8 @@
 
 The controller passes the in-memory model to this service. The service creates
 an ephemeral, self-contained JSON snapshot (plus referenced images) for the
-converter; it never reads or writes ARIADNE's internal JSON repository.
+converter. Referenced catalogs are resolved read-only; export never writes
+application records.
 """
 from __future__ import annotations
 
@@ -43,18 +44,5 @@ class PresentationExportService:
     @staticmethod
     def _stage_images(snapshot: dict, temp_root: Path) -> None:
         """Copy available referenced images beside the temporary JSON snapshot."""
-        handler = get_image_handler()
-        images_root = temp_root / "images"
-        for shape in snapshot.get("shapes", []):
-            image_ref = shape.get("image_path") if isinstance(shape, dict) else None
-            if not image_ref:
-                continue
-            source = Path(handler.get_full_path(image_ref))
-            if not source.is_file():
-                continue
-            normalized = str(image_ref).replace("\\", "/")
-            relative = normalized[7:] if normalized.startswith("images/") else source.name
-            destination = images_root / relative.lstrip("/")
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, destination)
-            shape["image_path"] = f"images/{relative.lstrip('/')}"
+        from .image_staging import stage_images
+        stage_images(snapshot, temp_root, get_image_handler())

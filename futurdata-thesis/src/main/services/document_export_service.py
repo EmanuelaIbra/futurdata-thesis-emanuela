@@ -5,6 +5,7 @@ import json
 import shutil
 import tempfile
 from pathlib import Path
+from ..utils.material_display import material_text
 from ..utils.image_handler import get_image_handler
 from ..utils.text_layout import normalize_export_titles
 from ..loader_se.disassembly_loader import build_guide, write_json
@@ -68,24 +69,8 @@ class DocumentExportService:
 
     @staticmethod
     def _stage_images(snapshot, root):
-        handler = get_image_handler()
-        images = root / "images"
-        for shape in snapshot.get("shapes", []):
-            ref = shape.get("image_path") if isinstance(shape, dict) else None
-            if not ref:
-                continue
-            src = Path(handler.get_full_path(ref))
-            if not src.is_file():
-                continue
-            rel = (
-                str(ref).replace("\\", "/")[7:]
-                if str(ref).replace("\\", "/").startswith("images/")
-                else src.name
-            )
-            dst = images / rel
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dst)
-            shape["image_path"] = f"images/{rel}"
+        from .image_staging import stage_images
+        stage_images(snapshot, root, get_image_handler())
 
     @staticmethod
     def _publish_images(source_dir, destination_dir):
@@ -141,7 +126,7 @@ class DocumentExportService:
                     if item.weight is not None
                     else "—"
                 )
-                cells[2].text = str(item.material or "—")
+                cells[2].text = material_text(item.material, item.material_details) or "Unknown"
                 cells[3].text = str(item.color or "—")
         for step in guide.steps:
             doc.add_heading(f"Step {step.index}: {step.operation}", 1)

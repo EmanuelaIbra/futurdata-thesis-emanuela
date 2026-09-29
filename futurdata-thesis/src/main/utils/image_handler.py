@@ -6,6 +6,7 @@ import os
 import shutil
 import hashlib
 from datetime import datetime
+from uuid import uuid4
 from typing import Optional
 
 
@@ -87,19 +88,17 @@ class ImageHandler:
             relative_path = os.path.relpath(existing_file, self.images_dir)
             return f"images/{relative_path}".replace("\\", "/")
         
-        # Generate unique filename
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        if entity_id:
-            filename = f"{prefix}_{entity_id}_{timestamp}{file_ext}"
-        else:
-            filename = f"{prefix}_{timestamp}{file_ext}"
-        
-        target_path = os.path.join(target_dir, filename)
-        
-        # Copy the file
+        # Exclusive creation makes UUID collisions harmless, even across processes.
         try:
-            shutil.copy2(source_path, target_path)
-            
+            while True:
+                target_path = os.path.join(target_dir, f"{prefix}_{uuid4().hex}{file_ext}")
+                try:
+                    with open(target_path, "xb") as dest, open(source_path, "rb") as source:
+                        shutil.copyfileobj(source, dest)
+                    break
+                except FileExistsError:
+                    continue
+
             # Return relative path from images directory
             relative_path = os.path.relpath(target_path, self.images_dir)
             return f"images/{relative_path}".replace("\\", "/")
@@ -109,15 +108,15 @@ class ImageHandler:
     
     def _calculate_file_hash(self, file_path: str) -> str:
         """
-        Calculate MD5 hash of a file.
+        Calculate SHA-256 hash of a file.
         
         Args:
             file_path: Path to the file
             
         Returns:
-            MD5 hash string
+            SHA-256 hash string
         """
-        hash_md5 = hashlib.md5()
+        hash_md5 = hashlib.sha256()
         try:
             with open(file_path, "rb") as f:
                 # Read in chunks to handle large files
@@ -180,6 +179,7 @@ class ImageHandler:
         if os.path.isabs(relative_path):
             return relative_path
         
+        relative_path = str(relative_path).replace('\\', '/')
         # Remove 'images/' prefix if present
         if relative_path.startswith("images/"):
             relative_path = relative_path[7:]

@@ -539,6 +539,7 @@ class RepositorySyncTests(unittest.TestCase):
         self.assertEqual(leaf_call.kwargs["node_type"], "Leaf")
 
     def test_ensure_action_id_creates_once(self):
+        self._add_root()
         diamond = DiamondStep(100, 100)
         diamond.name = "Unscrew"
 
@@ -603,6 +604,7 @@ class RepositorySyncTests(unittest.TestCase):
         self.assertIn("storage sync warning", status)
 
     def test_diamond_to_diamond_chains_actions_on_same_step(self):
+        self._add_root()
         first = DiamondStep(100, 100)
         first.db_step_id = 11
         second = DiamondStep(300, 100)

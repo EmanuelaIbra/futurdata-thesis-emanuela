@@ -33,7 +33,43 @@ class DiagramLoader:
         if not product:
             return None
         
+        record = self.repository.get_diagram(product.get("diagram_id"))
+        if isinstance(record, dict) and record.get("snapshot"):
+            diagram = Diagram.from_dict(record["snapshot"])
+            diagram.diagram_id = product["diagram_id"]
+            removed = []
+            for shape in diagram.shapes:
+                if isinstance(shape, ComponentBox):
+                    row = self.repository.get_component(shape.properties.get("db_id"))
+                    if row and row["diagram_id"] == diagram.diagram_id:
+                        for key in list(shape.properties):
+                            if key in row and key != "db_id":
+                                shape.properties[key] = row[key]
+                        shape.text = row["name"]
+                    else:
+                        removed.append(shape)
+                elif isinstance(shape, ActionCircle):
+                    row = self.repository.get_step(getattr(shape, "db_step_id", None))
+                    if row and row["diagram_id"] == diagram.diagram_id:
+                        shape.text, shape.step_description, shape.image_path = row.get("title", ""), row.get("description", ""), row.get("image_path", "")
+                    else:
+                        removed.append(shape)
+                elif isinstance(shape, DiamondStep):
+                    row = self.repository.get_action(getattr(shape, "db_action_id", None))
+                    if row and row["diagram_id"] == diagram.diagram_id:
+                        shape.text = shape.name = row["name"]
+                        shape.description, shape.image_path = row.get("description", ""), row.get("image_path", "")
+                        shape.tool_id, shape.tools = row.get("tool_id"), row.get("tool_name") or ""
+                    else:
+                        removed.append(shape)
+            for shape in removed:
+                diagram.remove_shape(shape)
+            diagram.shapes = [s for s in diagram.shapes if not isinstance(s, ArrowShape) or (s.from_shape in diagram.shapes and s.to_shape in diagram.shapes)]
+            diagram.modified = False
+            return diagram
         diagram = Diagram()
+        if product.get("diagram_id"):
+            diagram.diagram_id = product["diagram_id"]
         shape_map = {}  # db_id -> shape object
         
         # Layout configuration

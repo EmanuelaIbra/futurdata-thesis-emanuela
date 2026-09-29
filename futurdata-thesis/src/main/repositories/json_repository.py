@@ -11,6 +11,11 @@ import json
 import os
 import re
 import tempfile
+import shutil
+import warnings
+from uuid import uuid4
+from contextlib import contextmanager
+from .migration import migrate_v1, OWNED
 from datetime import datetime
 from pathlib import Path
 from threading import RLock
@@ -34,15 +39,31 @@ class JsonRepository:
 
     def __init__(self, file_path: str | None = None):
         app_dir = Path("D:/.disassembly_diagram")
-        app_dir.mkdir(parents=True, exist_ok=True)
         self.file_path = Path(file_path) if file_path else app_dir / "ariadne_data.json"
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = RLock()
+        self._transaction_depth = 0
         self._data = self._load_or_create()
+        diagram_ids = [d["id"] for d in self._data["diagrams"]]
+        if len(diagram_ids) != len(set(diagram_ids)):
+            raise ValueError("Duplicate diagram identity")
+        for collection in self.COLLECTIONS:
+            ids = [row["id"] for row in self._data[collection]]
+            if len(ids) != len(set(ids)):
+                raise ValueError(f"Duplicate IDs in {collection}")
+            for row in self._data[collection]:
+                self._validate_row(collection, row)
+        if getattr(self, "_migration_required", False):
+            backup = self.file_path.with_name(self.file_path.name + f".v1.{uuid4().hex}.bak")
+            shutil.copy2(self.file_path, backup)
+            self.migration_backup_path = str(backup)
+            self._write()
+            if self._data["migration_report"]:
+                warnings.warn("Repository migration preserved unresolved records; inspect migration_report and legacy_unresolved", RuntimeWarning)
 
     # ---------- storage ----------
     def _empty_data(self) -> Dict[str, Any]:
-        data = {"schema_version": 1, "updated_at": datetime.now().isoformat(), "counters": {}}
+        data = {"schema_version": 2, "diagrams": [], "migration_report": [], "legacy_unresolved": {}, "updated_at": datetime.now().isoformat(), "counters": {}}
         for name in self.COLLECTIONS:
             data[name] = []
             data["counters"][name] = 0
@@ -50,24 +71,22 @@ class JsonRepository:
 
     def _load_or_create(self) -> Dict[str, Any]:
         if self.file_path.exists():
-            try:
-                with self.file_path.open("r", encoding="utf-8") as f:
-                    data = json.load(f)
-                for name in self.COLLECTIONS:
-                    data.setdefault(name, [])
-                data.setdefault("counters", {})
-                for name in self.COLLECTIONS:
-                    data["counters"][name] = max(
-                        int(data["counters"].get(name, 0)),
-                        max((int(x.get("id", 0)) for x in data[name]), default=0),
-                    )
-                return data
-            except (OSError, json.JSONDecodeError, TypeError, ValueError):
-                backup = self.file_path.with_suffix(self.file_path.suffix + ".broken")
-                try:
-                    self.file_path.replace(backup)
-                except OSError:
-                    pass
+            # Fail closed: an unreadable or future schema must never be reset.
+            with self.file_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            version = data.get("schema_version", 1)
+            if version not in (1, 2):
+                raise ValueError(f"Unsupported repository schema: {version}")
+            for name in self.COLLECTIONS:
+                data.setdefault(name, [])
+            data.setdefault("counters", {})
+            for name in self.COLLECTIONS:
+                data["counters"][name] = max(int(data["counters"].get(name, 0)), max((int(x.get("id", 0)) for x in data[name]), default=0))
+            if version == 1:
+                migrated = migrate_v1(data)
+                data = migrated
+                self._migration_required = True
+            return data
         data = self._empty_data()
         self._seed_defaults(data)
         self._write(data)
@@ -89,14 +108,18 @@ class JsonRepository:
 
     def _save(self) -> None:
         with self._lock:
-            self._write()
+            if not self._transaction_depth:
+                self._write()
 
     def _next_id(self, collection: str) -> int:
+        if collection in ("root_components", "intermediate_components") and int(self._data["counters"].get(collection, 0)) + 1 >= self._INTERMEDIATE_OFFSET:
+            raise ValueError("Component ID range exhausted; explicit ID migration required")
         self._data["counters"][collection] = int(self._data["counters"].get(collection, 0)) + 1
         return self._data["counters"][collection]
 
     def _insert(self, collection: str, values: Dict[str, Any]) -> int:
         row = dict(values)
+        self._validate_row(collection, row)
         row["id"] = self._next_id(collection)
         self._data[collection].append(row)
         self._save()
@@ -109,17 +132,158 @@ class JsonRepository:
         row = self._find(collection, row_id)
         if not row:
             return False
+        candidate = {**row, **updates}
+        self._validate_row(collection, candidate)
         row.update(updates)
         self._save()
         return True
 
     def _delete(self, collection: str, row_id: int) -> bool:
+        field = {"colors":"color_id", "materials":"material_id", "tools":"tool_id"}.get(collection)
+        if field and any(row.get(field) == row_id for name in OWNED for row in self._data[name]):
+            raise ValueError(f"Cannot delete referenced {collection} record")
         before = len(self._data[collection])
         self._data[collection] = [x for x in self._data[collection] if int(x.get("id", -1)) != int(row_id)]
         changed = len(self._data[collection]) != before
         if changed:
             self._save()
         return changed
+
+    @contextmanager
+    def transaction(self):
+        with self._lock:
+            original = copy.deepcopy(self._data)
+            self._transaction_depth += 1
+            try:
+                yield
+                if self._transaction_depth == 1:
+                    self._write()
+            except Exception:
+                self._data = original
+                raise
+            finally:
+                self._transaction_depth -= 1
+
+    def _validate_row(self, collection, row):
+        for field, catalog in (("color_id", "colors"), ("material_id", "materials"), ("tool_id", "tools"), ("category_id", "material_categories"), ("subcategory_id", "material_subcategories"), ("type_id", "material_types")):
+            value = row.get(field)
+            if value is not None and not self._find(catalog, value):
+                raise ValueError(f"Unknown {field}: {value}")
+        if collection not in OWNED:
+            return
+        owner = row.get("diagram_id")
+        if not owner or not any(d["id"] == owner for d in self._data["diagrams"]):
+            raise ValueError(f"{collection} requires a valid diagram_id")
+        if collection in ("intermediate_components", "leaf_components") and row.get("root_component_id") is None:
+            raise ValueError("A child component requires its root_component_id")
+        refs = {"root_component_id": "root_components", "input_root_component_id": "root_components", "input_intermediate_component_id": "intermediate_components", "input_leaf_component_id": "leaf_components", "disassembly_step_id": "disassembly_steps", "action_id": "actions", "intermediate_component_id": "intermediate_components", "leaf_component_id": "leaf_components"}
+        for key, target in refs.items():
+            if row.get(key) is not None:
+                parent = self._find(target, row[key])
+                if not parent or parent.get("diagram_id") != owner:
+                    raise ValueError(f"Dangling or cross-diagram {key}")
+        if collection == "disassembly_steps" and sum(row.get(k) is not None for k in ("input_root_component_id", "input_intermediate_component_id", "input_leaf_component_id")) != 1:
+            raise ValueError("A step requires exactly one input")
+
+    def get_migration_summary(self):
+        return {"unresolved": {k:len(v) for k,v in self._data.get("legacy_unresolved", {}).items()}, "report_count":len(self._data.get("migration_report", [])), "repository_path":str(self.file_path), "backup_path":getattr(self, "migration_backup_path", None)}
+
+    def get_diagram(self, diagram_id):
+        return copy.deepcopy(next((d for d in self._data["diagrams"] if d["id"] == diagram_id), None))
+
+    def save_diagram_snapshot(self, diagram_id, snapshot):
+        with self.transaction():
+            self._save_diagram_snapshot(diagram_id, copy.deepcopy(snapshot))
+
+    def _save_diagram_snapshot(self, diagram_id, snapshot):
+        record = next((d for d in self._data["diagrams"] if d["id"] == diagram_id), None)
+        if record is None:
+            raise ValueError("Unknown diagram")
+        if snapshot.get("diagram_id") != diagram_id:
+            raise ValueError("Snapshot belongs to another diagram")
+        ids = {shape["id"] for shape in snapshot["shapes"]}
+        retained = {name:set() for name in ("root_components", "intermediate_components", "leaf_components", "disassembly_steps", "actions")}
+        for shape in snapshot["shapes"]:
+            kind = shape["type"]
+            if kind in ("component", "product"):
+                table, rid = self._decode_component_id(shape["db_id"])
+                collection = self._collection_for_table(table)
+            elif kind in ("action", "diamond"):
+                collection = "disassembly_steps" if kind == "action" else "actions"
+                rid = shape["db_step_id"] if kind == "action" else shape["db_action_id"]
+            else:
+                continue
+            row = self._find(collection, rid)
+            if not row or row["diagram_id"] != diagram_id:
+                raise ValueError("Snapshot contains an unowned entity")
+            retained[collection].add(rid)
+        for edge in snapshot.get("connections", []) + [s for s in snapshot["shapes"] if s["type"] == "arrow"]:
+            if edge.get("from_shape_id", edge.get("from_id")) not in ids or edge.get("to_shape_id", edge.get("to_id")) not in ids:
+                raise ValueError("Snapshot contains a dangling connection")
+        # Save is a replacement of this diagram's active entities, not append-only.
+        for collection, keep in retained.items():
+            self._data[collection] = [r for r in self._data[collection] if r["diagram_id"] != diagram_id or r["id"] in keep]
+        for collection, target, key in (("disassembly_step_actions", "actions", "action_id"), ("step_output_intermediate", "intermediate_components", "intermediate_component_id"), ("step_output_leaf", "leaf_components", "leaf_component_id")):
+            self._data[collection] = [r for r in self._data[collection] if r["diagram_id"] != diagram_id or (r["disassembly_step_id"] in retained["disassembly_steps"] and r[key] in retained[target])]
+        self._sync_snapshot_links(diagram_id, snapshot)
+        stored = copy.deepcopy(snapshot)
+        for shape in stored["shapes"]:
+            if shape.get("material_id") is not None:
+                shape.pop("material", None)
+                shape.pop("material_details", None)
+            if shape.get("color_id") is not None:
+                shape.pop("color", None)
+        record["snapshot"] = stored
+        self._save()
+
+    def _sync_snapshot_links(self, owner, snapshot):
+        """Project the canvas graph into owned relational links, preserving link IDs."""
+        nodes = {s["id"]:s for s in snapshot["shapes"]}
+        edges = {(e.get("from_shape_id", e.get("from_id")), e.get("to_shape_id", e.get("to_id"))) for e in snapshot.get("connections", []) + [s for s in snapshot["shapes"] if s["type"] == "arrow"]}
+        action_steps = {}
+        inputs, outputs = {}, set()
+        for source, target in edges:
+            a, b = nodes[source], nodes[target]
+            if {a["type"], b["type"]} == {"action", "diamond"}:
+                circle, diamond = (a,b) if a["type"] == "action" else (b,a)
+                action_steps.setdefault(diamond["db_action_id"], set()).add(circle["db_step_id"])
+        # Legacy diamond chains inherit only the explicitly connected step(s).
+        for _ in range(len(nodes)):
+            changed = False
+            for source, target in edges:
+                a, b = nodes[source], nodes[target]
+                if a["type"] == b["type"] == "diamond":
+                    current = action_steps.setdefault(b["db_action_id"], set())
+                    before = len(current)
+                    current.update(action_steps.get(a["db_action_id"], set()))
+                    changed |= len(current) != before
+            if not changed:
+                break
+        for source, target in edges:
+            a, b = nodes[source], nodes[target]
+            if a["type"] in ("component", "product"):
+                steps = {b["db_step_id"]} if b["type"] == "action" else action_steps.get(b.get("db_action_id"), set())
+                for step in steps:
+                    inputs.setdefault(step, set()).add(a["db_id"])
+            if b["type"] in ("component", "product"):
+                steps = {a["db_step_id"]} if a["type"] == "action" else action_steps.get(a.get("db_action_id"), set())
+                outputs.update((step, b["db_id"]) for step in steps)
+        for step, components in inputs.items():
+            if len(components) != 1:
+                raise ValueError("Step has ambiguous input components")
+            self.update_step(step, component_id=next(iter(components)))
+        desired_actions = {(step, action) for action, steps in action_steps.items() for step in steps}
+        self._data["disassembly_step_actions"] = [r for r in self._data["disassembly_step_actions"] if r["diagram_id"] != owner or (r["disassembly_step_id"], r["action_id"]) in desired_actions]
+        for collection, table, key in (("step_output_intermediate", "intermediate_component", "intermediate_component_id"), ("step_output_leaf", "leaf_component", "leaf_component_id")):
+            self._data[collection] = [r for r in self._data[collection] if r["diagram_id"] != owner or (r["disassembly_step_id"], self._encode_component_id(table, r[key])) in outputs]
+        for step, action in sorted(desired_actions):
+            self.add_action_to_step(step, action)
+        for step, component in sorted(outputs):
+            self.add_component_to_step(step, component)
+        for shape in snapshot["shapes"]:
+            if shape["type"] == "diamond":
+                steps = action_steps.get(shape["db_action_id"], set())
+                shape["db_step_id"] = next(iter(steps)) if len(steps) == 1 else None
 
     def _seed_defaults(self, data: Dict[str, Any]) -> None:
         def add(collection, **values):
@@ -167,9 +331,16 @@ class JsonRepository:
         return {"root_component":"root_components", "intermediate_component":"intermediate_components", "leaf_component":"leaf_components"}[table]
 
     # ---------- products/components ----------
-    def create_product(self, name: str, brand: str = "", model: str = "", description: str = "", x: float = 400, y: float = 100) -> int:
+    def create_product(self, name: str, brand: str = "", model: str = "", description: str = "", x: float = 400, y: float = 100, diagram_id=None) -> int:
         now = datetime.now().isoformat()
-        return self._insert("root_components", {"name":name,"brand":brand,"model":model,"description":description,"created_at":now,"modified_at":now,"color_id":None,"material_id":None,"weight":None,"weight_unit":"g","node_type":"Root","image_path":""})
+        diagram_id = diagram_id or str(uuid4())
+        if self.get_diagram(diagram_id):
+            raise ValueError("Diagram already has a root")
+        with self.transaction():
+            self._data["diagrams"].append({"id": diagram_id, "name": name})
+            root_id = self._insert("root_components", {"diagram_id": diagram_id, "name":name,"brand":brand,"model":model,"description":description,"created_at":now,"modified_at":now,"color_id":None,"material_id":None,"weight":None,"weight_unit":"g","node_type":"Root","image_path":""})
+            self._data["diagrams"][-1]["root_component_id"] = root_id
+            return root_id
 
     def get_product(self, product_id: int):
         row = self._find("root_components", product_id)
@@ -189,22 +360,26 @@ class JsonRepository:
 
     def delete_product(self, product_id: int):
         if not self._find("root_components", product_id): return False
-        component_ids = [self._encode_component_id("intermediate_component", x["id"]) for x in self._data["intermediate_components"] if x.get("root_component_id")==product_id]
-        component_ids += [self._encode_component_id("leaf_component", x["id"]) for x in self._data["leaf_components"] if x.get("root_component_id")==product_id]
-        for cid in component_ids: self.delete_component(cid)
-        root_steps=[x["id"] for x in self._data["disassembly_steps"] if x.get("input_root_component_id")==product_id]
-        for sid in root_steps: self.delete_step(sid)
-        return self._delete("root_components", product_id)
+        owner = self.get_product(product_id)["diagram_id"]
+        with self.transaction():
+            for collection in OWNED:
+                self._data[collection] = [r for r in self._data[collection] if r.get("diagram_id") != owner]
+            self._data["diagrams"] = [d for d in self._data["diagrams"] if d["id"] != owner]
+        return True
 
-    def create_component(self, name: str, product_id: int=None, color_id: int=None, material_id: int=None, weight: float=None, weight_unit: str="g", node_type: str="", x: float=0, y: float=0):
+    def create_component(self, name: str, product_id: int=None, color_id: int=None, material_id: int=None, weight: float=None, weight_unit: str="g", node_type: str="", x: float=0, y: float=0, diagram_id=None):
         normalized=(node_type or "Intermediate").strip().lower()
         if normalized in ("root","product"):
-            rid=self.create_product(name); self.update_component(rid, weight=weight, weight_unit=weight_unit, node_type="Root"); return rid
+            with self.transaction():
+                rid = self.create_product(name, diagram_id=diagram_id)
+                self.update_component(rid, color_id=color_id, material_id=material_id, weight=weight, weight_unit=weight_unit, node_type="Root")
+            return rid
         table="leaf_component" if normalized=="leaf" else "intermediate_component"
         if product_id is None: raise ValueError("product_id (root component id) is required")
         collection=self._collection_for_table(table)
-        if table=="intermediate_component": color_id=material_id=None
-        rid=self._insert(collection,{"root_component_id":int(product_id),"color_id":color_id,"material_id":material_id,"name":name,"weight":weight,"weight_unit":weight_unit,"node_type":"Leaf" if table=="leaf_component" else "Intermediate","image_path":""})
+        root = self.get_product(product_id)
+        if not root: raise ValueError("Unknown root component")
+        rid=self._insert(collection,{"diagram_id":root["diagram_id"],"root_component_id":int(product_id),"color_id":color_id,"material_id":material_id,"name":name,"weight":weight,"weight_unit":weight_unit,"node_type":"Leaf" if table=="leaf_component" else "Intermediate","image_path":""})
         return self._encode_component_id(table,rid)
 
     def _decorate_component(self, table: str, row: Dict[str,Any]):
@@ -227,7 +402,7 @@ class JsonRepository:
     def get_root_component(self, product_id: int): return self.get_component(product_id)
 
     def update_component(self, component_id: int, **kwargs):
-        table,rid=self._decode_component_id(component_id); allowed={"name","weight","weight_unit","node_type","image_path","brand","model","description"}
+        table,rid=self._decode_component_id(component_id); allowed={"color_id","material_id","name","weight","weight_unit","node_type","image_path","brand","model","description"}
         if table=="leaf_component": allowed |= {"color_id","material_id","root_component_id"}
         elif table=="intermediate_component": allowed |= {"root_component_id"}
         updates={k:v for k,v in kwargs.items() if k in allowed}
@@ -239,7 +414,7 @@ class JsonRepository:
         table,rid=self._decode_component_id(component_id); collection=self._collection_for_table(table)
         if not self._find(collection,rid): return False
         if table=="root_component": return self.delete_product(rid)
-        for sid in [x["id"] for x in self._data["disassembly_steps"] if x.get("input_intermediate_component_id")==rid or x.get("input_leaf_component_id")==rid]: self.delete_step(sid)
+        for sid in [x["id"] for x in self._data["disassembly_steps"] if x.get("input_" + table + "_id")==rid]: self.delete_step(sid)
         self._data["step_output_intermediate"]=[x for x in self._data["step_output_intermediate"] if not(table=="intermediate_component" and x.get("intermediate_component_id")==rid)]
         self._data["step_output_leaf"]=[x for x in self._data["step_output_leaf"] if not(table=="leaf_component" and x.get("leaf_component_id")==rid)]
         return self._delete(collection,rid)
@@ -276,8 +451,28 @@ class JsonRepository:
         if material_id is None:return None
         row=self._find("materials",material_id); return self._decorate_material(row) if row else None
     def get_all_materials(self): return sorted([self._decorate_material(x) for x in self._data["materials"]],key=lambda x:x["name"])
-    def update_material(self,material_id,**kwargs): return self._update("materials",material_id,{k:v for k,v in kwargs.items() if k in {"name","category_id","subcategory_id","type_id","technical_name","surface"}})
+    def update_material(self, material_id, **kwargs):
+        return self._update("materials", material_id, {k:v for k,v in kwargs.items() if k in {"name", "category_id", "subcategory_id", "type_id", "technical_name", "scientific_name", "surface"}})
     def delete_material(self,material_id): return self._delete("materials",material_id)
+    def resolve_material_selection(self, category_id, subcategory_id=None, type_id=None):
+        category = self._find("material_categories", category_id)
+        if not category:
+            raise ValueError("Select a valid material category")
+        if subcategory_id:
+            sub = self._find("material_subcategories", subcategory_id)
+            if not sub or sub.get("category_id") != category_id:
+                raise ValueError("Subcategory belongs to another category")
+        typ = self._find("material_types", type_id) if type_id else None
+        if type_id and (not typ or typ.get("category_id") != category_id or typ.get("subcategory_id") != subcategory_id):
+            raise ValueError("Material type belongs to another category/subcategory")
+        for material in self._data["materials"]:
+            if (material.get("category_id"), material.get("subcategory_id"), material.get("type_id")) == (category_id, subcategory_id, type_id):
+                return material["id"]
+            if not subcategory_id and not type_id and material.get("name") == category["name"] and not material.get("category_id"):
+                return material["id"]
+        name = typ["name"] if typ else sub["name"] if subcategory_id else category["name"]
+        return self.create_material(name, category_id, subcategory_id, type_id)
+
     def get_material_display_name(self,material_id):
         m=self.get_material(material_id)
         if not m:return "Unknown"
@@ -294,7 +489,9 @@ class JsonRepository:
     # ---------- steps/actions/relations ----------
     def create_step(self, component_id:int, step_order:int, description:str="", image_path:str="", action_id:int=None, title:str=""):
         table,rid=self._decode_component_id(component_id)
-        row={"input_root_component_id":rid if table=="root_component" else None,"input_intermediate_component_id":rid if table=="intermediate_component" else None,"input_leaf_component_id":rid if table=="leaf_component" else None,"step_order":int(step_order),"title":title,"description":description,"image_path":image_path}
+        component = self.get_component(component_id)
+        if not component: raise ValueError("Unknown step input")
+        row={"diagram_id":component["diagram_id"],"input_root_component_id":rid if table=="root_component" else None,"input_intermediate_component_id":rid if table=="intermediate_component" else None,"input_leaf_component_id":rid if table=="leaf_component" else None,"step_order":int(step_order),"title":title,"description":description,"image_path":image_path}
         sid=self._insert("disassembly_steps",row)
         if action_id is not None:self.add_action_to_step(sid,action_id)
         return sid
@@ -330,7 +527,13 @@ class JsonRepository:
         if step.get("input_root_component_id") is not None:return step["input_root_component_id"]
         if step.get("input_intermediate_component_id") is not None:return self.get_component_root_component_id(self._encode_component_id("intermediate_component",step["input_intermediate_component_id"]))
         if step.get("input_leaf_component_id") is not None:return self.get_component_root_component_id(self._encode_component_id("leaf_component",step["input_leaf_component_id"]))
-    def create_action(self,name,description="",tool_id=None,next_action_id=None,x=0,y=0): return self._insert("actions",{"name":name,"description":description,"tool_id":tool_id,"image_path":""})
+    def create_action(self, name, description="", tool_id=None, next_action_id=None, x=0, y=0, diagram_id=None):
+        if diagram_id is None:
+            owners = self._data["diagrams"]
+            if len(owners) != 1:
+                raise ValueError("Action requires explicit diagram ownership")
+            diagram_id = owners[0]["id"]
+        return self._insert("actions", {"diagram_id":diagram_id,"name":name,"description":description,"tool_id":tool_id,"image_path":""})
     def get_action(self,action_id):
         row=self._find("actions",action_id)
         if not row:return None
@@ -343,9 +546,12 @@ class JsonRepository:
         return self._delete("actions",action_id)
     def get_next_action_order(self,step_id): return max([x.get("action_order",0) for x in self._data["disassembly_step_actions"] if x.get("disassembly_step_id")==int(step_id)],default=0)+1
     def add_action_to_step(self,step_id,action_id,action_order=None):
+        step = self.get_step(step_id)
+        if not step: raise ValueError("Unknown step")
+        self._validate_row("disassembly_step_actions", {"diagram_id":step["diagram_id"], "disassembly_step_id":step_id, "action_id":action_id})
         existing=next((x for x in self._data["disassembly_step_actions"] if x.get("disassembly_step_id")==int(step_id) and x.get("action_id")==int(action_id)),None)
         if existing:return {"link_id":existing["id"],"action_order":existing["action_order"],"already_linked":True}
-        order=self.get_next_action_order(step_id); lid=self._insert("disassembly_step_actions",{"disassembly_step_id":int(step_id),"action_id":int(action_id),"action_order":order}); return {"link_id":lid,"action_order":order,"already_linked":False}
+        order=self.get_next_action_order(step_id); lid=self._insert("disassembly_step_actions",{"diagram_id":step["diagram_id"],"disassembly_step_id":int(step_id),"action_id":int(action_id),"action_order":order}); return {"link_id":lid,"action_order":order,"already_linked":False}
     def get_actions_for_step(self,step_id):
         links=sorted([x for x in self._data["disassembly_step_actions"] if x.get("disassembly_step_id")==int(step_id)],key=lambda x:x.get("action_order",0)); out=[]
         for link in links:
@@ -359,7 +565,7 @@ class JsonRepository:
         collection="step_output_intermediate" if table=="intermediate_component" else "step_output_leaf"; key="intermediate_component_id" if table=="intermediate_component" else "leaf_component_id"
         existing=next((x for x in self._data[collection] if x.get("disassembly_step_id")==int(step_id) and x.get(key)==rid),None)
         if existing:return {"link_id":existing["id"],"already_linked":True}
-        lid=self._insert(collection,{"disassembly_step_id":int(step_id),key:rid}); return {"link_id":lid,"already_linked":False}
+        lid=self._insert(collection,{"diagram_id":self.get_step(step_id)["diagram_id"],"disassembly_step_id":int(step_id),key:rid}); return {"link_id":lid,"already_linked":False}
     def get_components_from_step(self,step_id):
         out=[]
         for link in self._data["step_output_intermediate"]:
@@ -374,6 +580,28 @@ class JsonRepository:
         before=len(self._data[collection]); self._data[collection]=[x for x in self._data[collection] if not(x.get("disassembly_step_id")==int(step_id) and x.get(key)==rid)]; changed=len(self._data[collection])!=before
         if changed:self._save()
         return changed
+
+    def get_catalog_record(self, collection, record_id):
+        if collection not in {"colors", "materials", "tools", "material_categories", "material_subcategories", "material_types"}:
+            raise ValueError("Not a catalog collection")
+        row = self._find(collection, record_id)
+        return copy.deepcopy(row) if row else None
+
+    def import_catalogs(self, catalogs):
+        """Merge portable catalog definitions by value, never by foreign IDs."""
+        maps = {}
+        dependencies = {"category_id":"material_categories", "subcategory_id":"material_subcategories", "type_id":"material_types"}
+        for collection in ("colors", "material_categories", "material_subcategories", "material_types", "materials", "tools"):
+            maps[collection] = {}
+            for source in catalogs.get(collection, []):
+                row = {k:v for k,v in source.items() if k not in {"id", "category_name", "subcategory_name", "type_name"}}
+                for key, parent in dependencies.items():
+                    if key in row:
+                        row[key] = maps.get(parent, {}).get(row[key]) if row[key] is not None else None
+                existing = next((r for r in self._data[collection] if {k:v for k,v in r.items() if k != "id"} == row), None)
+                new_id = existing["id"] if existing else self._insert(collection, row)
+                maps[collection][source["id"]] = new_id
+        return maps
 
     # ---------- dynamic UI schema ----------
     _SCHEMAS={

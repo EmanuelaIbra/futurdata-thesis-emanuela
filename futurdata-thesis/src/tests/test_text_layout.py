@@ -146,6 +146,12 @@ def test_custom_tool_persists_and_clears_through_existing_repository(tmp_path):
     from src.main.repositories.json_repository import JsonRepository
     controller = AppController.__new__(AppController)
     controller.repository = JsonRepository(str(tmp_path / 'store.json'))
+    from src.main.models import Diagram, ComponentBox
+    controller.diagram = Diagram()
+    root = ComponentBox(0, 0)
+    root.properties['node_type'] = 'Root'
+    controller.diagram.shapes.append(root)
+    controller.current_product_id = None
     shape = DiamondStep(0, 0)
     shape.tools = 'Custom API function'
     controller._persist_shape_properties(shape)

@@ -425,6 +425,7 @@ class Component:
     image_path: Optional[str] = None
     kept_whole: bool = False
     contained_leaf_count: Optional[int] = None
+    material_details: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -553,6 +554,6 @@ class Guide:
     steps: tuple[Step, ...] = ()
     warnings: tuple[ValidationWarning, ...] = ()
     depth: Optional[DepthSpec] = None
-    schema_version: str = "1.1"
+    schema_version: str = "1.2"
     tools: tuple[str, ...] = ()
     bill_of_materials: Optional[tuple[Component, ...]] = None

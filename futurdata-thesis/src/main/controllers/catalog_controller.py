@@ -62,3 +62,6 @@ class CatalogController:
 
     def create_material_type(self, category_id, name, subcategory_id=None):
         return self._repository.create_material_type(category_id, name, subcategory_id)
+
+    def resolve_material_selection(self, category_id, subcategory_id=None, type_id=None):
+        return self._repository.resolve_material_selection(category_id, subcategory_id, type_id)
