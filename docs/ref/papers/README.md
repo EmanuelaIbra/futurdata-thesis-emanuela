@@ -1,8 +1,0 @@
-
-In this file I have added few comments on literature review.
-
-1) [Disassembly Sequence Planning: A survey](DSP-survey.pdf)
-    In this papers is presented the disassembly sequence planning problem. Essentially an assembly is an object commposed by many component that can be separated. Each assembly can be represented with a different notation: adiacent component Graph (directed/undirected), and/or graph, petri net, Matrix based. For each assembly this notation represents all possible disassembly sequences so in the paper is also presented methods to find the best disassembly sequence.
-2) [Disassembly Process Information Model for Remanufactoring](DisassemblyProcessInformationModel.pdf) It presents an information model (described with UML) about the disassembly process. It is a little bit technical (in UML) part, but it has two important things: it gives a defitition of **disassemblability** and it shows some nice example of assembly components **car suspension module** and **Flip-top cell phone** that we can use in our thesis
-3) [Disassembly Sequence Planning for Product Maintenance](thesis.pdf) This is a thesis that explain the general problem. It is more focused on the planning problem of finding an optimal sequence for the disassembly sequence process, but at the end some case study can be found and reused
-4) [BOM](https://www.techtarget.com/searcherp/definition/bill-of-materials-BoM#:~:text=A%20bill%20of%20materials%20(BOM)%20is%20a%20comprehensive%20inventory%20of,required%20to%20build%20a%20product.) - here are well explained some of the attributes we may want to add to our system 
