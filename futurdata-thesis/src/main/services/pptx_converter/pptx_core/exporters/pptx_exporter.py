@@ -19,7 +19,7 @@ from pptx.enum.text import MSO_ANCHOR, PP_ALIGN, MSO_AUTO_SIZE
 from pptx.util import Inches, Pt
 
 from .base import Exporter
-from .....utils.text_layout import normalize_export_titles, fit_office_text, office_lines
+from .....utils.text_layout import normalize_export_titles, fit_office_text
 from ..models import Step, WizardDocument
 from ..options import ExportOptions
 from ..utils import chunks, fit_rect, image_dimensions, normalize_text, resolve_image
@@ -58,7 +58,6 @@ class PPTXExporter(Exporter):
         # Normalization protects the renderer from invalid GUI values such as
         # zero groups per slide or an inverted start/end range.
         document = normalize_export_titles(document)
-        self._overflow = []
         options = options.normalized()
 
         # Step filtering happens before any slide is created, so all counters
@@ -103,7 +102,6 @@ class PPTXExporter(Exporter):
 
         footer_label, _ = self._layout_text(prs.slides[0], document.product.name,
                                              9.44, 0.16, 8, False)
-        self._overflow_slides(prs)
 
         # Footers are added only after every slide exists; this guarantees a
         # correct total-page value even when warnings and BoM require pagination.
@@ -178,7 +176,7 @@ class PPTXExporter(Exporter):
         paragraph = frame.paragraphs[0]
         paragraph.alignment = align
         paragraph.space_after = Pt(0)
-        paragraph.line_spacing = Pt(size * 1.25)
+        paragraph.line_spacing = 1.25
         run = paragraph.add_run()
         run.text = str(value)
         run.font.name = "Arial"
@@ -188,34 +186,19 @@ class PPTXExporter(Exporter):
         return box
 
     def _layout_text(self, slide, value, width, height, size, bold):
-        """Fit within allocated space; retain oversized text in numbered details."""
-        fitted = fit_office_text(str(value), width * 72, height * 72, size, bold)
+        """Keep the full text in its source box; never generate detail pages."""
+        value = str(value)
+        fitted = fit_office_text(value, width * 72, height * 72, size, bold)
         if fitted is not None:
             return fitted
-        if not hasattr(self, '_overflow'):
-            self._overflow = []
-        number = len(self._overflow) + 1
-        self._overflow.append((number, slide, str(value)))
-        marker = f"Details [{number}]"
-        # Tiny captions may only have room for the reference number.
-        fitted = fit_office_text(marker, width * 72, height * 72, min(size, 10), bold)
-        if fitted is None:
-            marker = f"[{number}]"
-            fitted = fit_office_text(marker, width * 72, height * 72, min(size, 8), bold)
-        return fitted or (marker, 6)
-
-    def _overflow_slides(self, prs):
-        """Paginate measured lines at 14 pt, with a reference to the source slide."""
-        pending = list(self._overflow)
-        for number, source, value in pending:
-            source_number = next(i for i, slide in enumerate(prs.slides, 1)
-                                 if slide.slide_id == source.slide_id)
-            lines = office_lines(value, 11.8 * 72, 14)
-            for page, group in enumerate(chunks(lines, 18), 1):
-                slide = self._blank(prs)
-                self._section_title(slide, "Continued text",
-                                    f"Details [{number}] - slide {source_number}, part {page}")
-                self._text(slide, "\n".join(group), 0.7, 1.8, 11.9, 4.9, 14)
+        # Dense fields must shrink in place instead of being replaced with a
+        # Details marker. Ordinary text retains the existing readable sizes.
+        for candidate in range(min(8, int(size) - 1), 0, -1):
+            fitted = fit_office_text(value, width * 72, height * 72, candidate, bold)
+            if fitted is not None:
+                return fitted
+        # Retain even extreme input, with Office autofit enabled on the frame.
+        return value, 1
 
     def _section_title(self, slide, eyebrow: str, title: str, subtitle: str | None = None):
         self._text(slide, eyebrow.upper(), 0.65, 0.36, 5.8, 0.28, 10, True, self.TEAL)
@@ -409,7 +392,7 @@ class PPTXExporter(Exporter):
         frame.word_wrap = True
         frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
         for paragraph in frame.paragraphs:
-            paragraph.line_spacing = Pt(size * 1.25)
+            paragraph.line_spacing = 1.25
             paragraph.space_after = Pt(0)
             for run in paragraph.runs:
                 run.font.name = "Arial"

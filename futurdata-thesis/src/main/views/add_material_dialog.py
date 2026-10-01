@@ -1,3 +1,4 @@
+from .dialog_layout import center_on_workspace
 import tkinter as tk
 from tkinter import ttk, messagebox
 
@@ -25,6 +26,7 @@ class _SimpleNameDialog(tk.Toplevel):
         ttk.Button(button_frame, text="Add", command=self._submit).pack(side="left", padx=(0, 6))
         ttk.Button(button_frame, text="Cancel", command=self.destroy).pack(side="left")
 
+        center_on_workspace(self, parent)
         self.grab_set()
         self.wait_window(self)
 
@@ -44,9 +46,8 @@ class AddMaterialDialog(tk.Toplevel):
     """
     A modal dialog window that allows users to register a new material entry.
     
-    Provides entry fields for the material's common name and scientific name, 
-    and incorporates a read-only Combobox drop-down dynamically populated with 
-    pre-existing color entries fetched from the JSON storage layer.
+    Provides name and technical-name fields plus category, subcategory, and
+    type selectors loaded through the catalog controller.
     """
 
     def __init__(self, parent, controller):
@@ -63,6 +64,7 @@ class AddMaterialDialog(tk.Toplevel):
         self.title("Add New Material")
         self.resizable(False, False)
         self.controller = controller
+        self.result = None
         self.repository = controller.catalog
 
         self._apply_combobox_style()
@@ -77,6 +79,7 @@ class AddMaterialDialog(tk.Toplevel):
         self._load_categories()
         self._bind_events()
 
+        center_on_workspace(self, parent)
         self.grab_set()
         self.wait_window(self)
 
@@ -198,6 +201,14 @@ class AddMaterialDialog(tk.Toplevel):
         else:
             self.type_var.set("")
 
+    def refresh_catalogs(self):
+        category = self.category_map.get(self.category_var.get())
+        subcategory = self.subcategory_map.get(self.subcategory_var.get())
+        material_type = self.type_map.get(self.type_var.get())
+        self._load_categories(category)
+        self._load_subcategories(subcategory)
+        self._load_types(material_type)
+
     def _on_category_change(self):
         self._load_subcategories()
 
@@ -206,7 +217,7 @@ class AddMaterialDialog(tk.Toplevel):
 
     def _add_category(self):
         def submit(name):
-            category_id = self.repository.create_material_category(name)
+            category_id = self.controller.add_new_material_category(name)
             self._load_categories(select_id=category_id)
             self.category_var.set(name)
             self._load_subcategories()
@@ -220,7 +231,7 @@ class AddMaterialDialog(tk.Toplevel):
             return
 
         def submit(name):
-            subcategory_id = self.repository.create_material_subcategory(category_id, name)
+            subcategory_id = self.controller.add_new_material_subcategory(category_id, name)
             self._load_subcategories(select_id=subcategory_id)
             self.subcategory_var.set(name)
             self._load_types()
@@ -236,7 +247,7 @@ class AddMaterialDialog(tk.Toplevel):
         subcategory_id = self.subcategory_map.get(self.subcategory_var.get()) if self.subcategory_var.get() else None
 
         def submit(name):
-            type_id = self.repository.create_material_type(category_id, name, subcategory_id)
+            type_id = self.controller.add_new_material_type(category_id, name, subcategory_id)
             self._load_types(select_id=type_id)
             self.type_var.set(name)
 
@@ -253,7 +264,7 @@ class AddMaterialDialog(tk.Toplevel):
         type_id = self.type_map.get(self.type_var.get()) if self.type_var.get() else None
         technical_name = self.technical_name_var.get().strip()
         try:
-            self.controller.add_new_material(
+            self.result = self.controller.add_new_material(
                 name=name,
                 category_id=category_id,
                 subcategory_id=subcategory_id,

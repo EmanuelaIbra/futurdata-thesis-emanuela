@@ -119,8 +119,8 @@ class PropertiesPanelTests(unittest.TestCase):
         self.assertIn("description", self.panel.dynamic_fields)
         self.assertIn("image_path", self.panel.dynamic_fields)
 
-    def test_load_shape_loads_legacy_tool_in_editable_entry(self):
-        """Legacy tool IDs display their names in a free-text entry."""
+    def test_load_shape_loads_tool_in_readonly_selector(self):
+        """Tool IDs display their names in a read-only catalog selector."""
         shape = DiamondStep(100, 100)
         shape.name = "Decision A"
         shape.description = "Evaluate condition"
@@ -141,16 +141,19 @@ class PropertiesPanelTests(unittest.TestCase):
         self.assertIn("tool_id", self.panel.dynamic_fields)
         
         widget = self.panel.dynamic_fields["tool_id"]
-        self.assertIsInstance(widget, ttk.Entry)
-        self.assertNotIsInstance(widget, ttk.Combobox)
+        self.assertIsInstance(widget, ttk.Combobox)
+        self.assertEqual(str(widget['state']), 'readonly')
         self.assertEqual(widget.get(), "Tool 2")
-        widget.delete(0, tk.END)
-        widget.insert(0, "Custom function / API")
+        widget.set("Tool 1")
         self.panel._update_shape_properties()
-        self.assertEqual(shape.tools, "Custom function / API")
-        self.assertIsNone(shape.tool_id)
+        self.assertEqual(shape.tools, "Tool 1")
+        self.assertEqual(shape.tool_id, 1)
         self.panel.load_shape(shape)
-        self.assertEqual(self.panel.dynamic_fields['tool_id'].get(), "Custom function / API")
+        self.assertEqual(self.panel.dynamic_fields['tool_id'].get(), "Tool 1")
+        self.panel.dynamic_fields['tool_id'].set('')
+        self.panel._update_shape_properties()
+        self.assertIsNone(shape.tool_id)
+        self.assertEqual(shape.tools, '')
 
     def test_on_apply_extracts_and_updates_component_box_model(self):
         """Test that data written in the UI saves into the ComponentBox model."""
@@ -237,14 +240,14 @@ class PropertiesPanelTests(unittest.TestCase):
         self.assertEqual(shape.tools, "Special Tool")
         self.mock_on_apply.assert_called_once()
 
-    def test_refresh_reloads_values_from_current_shape(self):
-        """Validate that the refresh method re-invokes load_shape to update fields from the DB."""
+    def test_catalog_refresh_does_not_rebuild_form(self):
+        """Catalog refresh must not reload the shape and discard unapplied fields."""
         shape = MagicMock(spec=ComponentBox)
         self.panel.current_shape = shape
         
         with patch.object(self.panel, "load_shape") as mock_load_shape:
             self.panel.refresh()
-            mock_load_shape.assert_called_with(shape)
+            mock_load_shape.assert_not_called()
 
 
 if __name__ == "__main__":

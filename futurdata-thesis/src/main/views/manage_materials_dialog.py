@@ -1,3 +1,4 @@
+from .dialog_layout import center_on_workspace
 import tkinter as tk
 from tkinter import ttk, messagebox
 
@@ -43,6 +44,7 @@ class ManageMaterialsDialog(tk.Toplevel):
         self.material_records = {}
         self.load_materials()
         
+        center_on_workspace(self, parent)
         self.grab_set()
         self.wait_window(self)
 
@@ -55,6 +57,9 @@ class ManageMaterialsDialog(tk.Toplevel):
             display_text = m['name']
             self.listbox.insert(tk.END, display_text)
             self.material_records[display_text] = m['id']
+
+    def refresh_catalogs(self):
+        self.load_materials()
 
     def on_delete(self):
         """

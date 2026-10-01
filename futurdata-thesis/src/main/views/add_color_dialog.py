@@ -1,3 +1,4 @@
+from .dialog_layout import center_on_workspace
 import tkinter as tk
 from tkinter import ttk, colorchooser, messagebox
 
@@ -23,6 +24,7 @@ class AddColorDialog(tk.Toplevel):
         self.transient(parent)
         self.title("Add New Color")
         self.controller = controller
+        self.result = None
         self.result = None
 
         self.name_var = tk.StringVar()
@@ -58,6 +60,7 @@ class AddColorDialog(tk.Toplevel):
         ttk.Button(button_frame, text="Save", command=self.on_save).pack(side="left", padx=5)
         ttk.Button(button_frame, text="Cancel", command=self.destroy).pack(side="left")
 
+        center_on_workspace(self, parent)
         self.grab_set()
         self.wait_window(self)
 
@@ -69,7 +72,7 @@ class AddColorDialog(tk.Toplevel):
         extracts the Hex code, converts float-based RGB coordinates into integers,
         and injects them back into the window's bound Tkinter variables.
         """
-        color_code = colorchooser.askcolor(title="Choose color")
+        color_code = colorchooser.askcolor(title="Choose color", parent=self)
         if color_code and color_code[0] and color_code[1]:
             rgb, hex_code = color_code
             r, g, b = map(int, rgb)
@@ -98,7 +101,7 @@ class AddColorDialog(tk.Toplevel):
             return
 
         try:
-            self.controller.add_new_color(name, hex_code, r_int, g_int, b_int)
+            self.result = self.controller.add_new_color(name, hex_code, r_int, g_int, b_int)
             self.destroy()
         except ValueError as exc:
             messagebox.showerror("Error", str(exc))

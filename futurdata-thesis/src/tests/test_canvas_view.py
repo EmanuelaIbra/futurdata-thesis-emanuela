@@ -293,7 +293,7 @@ class CanvasViewTests(unittest.TestCase):
         self.mock_delete.assert_any_call("all")
         self.mock_create_rect.assert_called_once()
         self.assertTrue(self.mock_create_line.called)
-        self.mock_scale.assert_called_once_with("all", 0, 0, 1.5, 1.5)
+        self.mock_scale.assert_not_called()  # Each item is transformed at creation.
 
     def test_move_items_translates_ids_without_redrawing(self):
         """Checks that moving items uses the canvas translate command 
@@ -338,14 +338,14 @@ class CanvasViewTests(unittest.TestCase):
         """Validates that the zoom factor is correctly multiplied by the scaling decrement."""
         initial_zoom = self.canvas.zoom_factor
         self.canvas.zoom_out()
-        self.assertAlmostEqual(self.canvas.zoom_factor, initial_zoom * 0.9)
+        self.assertAlmostEqual(self.canvas.zoom_factor, initial_zoom / 1.1)
 
     def test_zoom_limits_prevent_excessive_scaling(self):
         """Confirms that the zoom logic enforces upper bounds and 
         prevents redundant scaling commands if the limit is reached."""
-        self.canvas.zoom_factor = 2.9
+        self.canvas.zoom_factor = 4.0
         self.canvas.zoom_in()
-        self.assertEqual(self.canvas.zoom_factor, 2.9)
+        self.assertEqual(self.canvas.zoom_factor, 4.0)
         self.mock_scale.assert_not_called()
 
     def test_reset_zoom_restores_one_dot_zero_scale(self):

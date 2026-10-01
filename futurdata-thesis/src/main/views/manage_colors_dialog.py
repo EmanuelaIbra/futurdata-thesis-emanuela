@@ -1,3 +1,4 @@
+from .dialog_layout import center_on_workspace
 import tkinter as tk
 from tkinter import ttk, messagebox
 
@@ -43,6 +44,7 @@ class ManageColorsDialog(tk.Toplevel):
         self.color_records = {}
         self.load_colors()
         
+        center_on_workspace(self, parent)
         self.grab_set()
         self.wait_window(self)
 
@@ -55,6 +57,9 @@ class ManageColorsDialog(tk.Toplevel):
             display_text = f"{c['name']} ({c['hex_code']})"
             self.listbox.insert(tk.END, display_text)
             self.color_records[display_text] = c['id']
+
+    def refresh_catalogs(self):
+        self.load_colors()
 
     def on_delete(self):
         """

@@ -1,3 +1,4 @@
+from .dialog_layout import center_on_workspace
 import tkinter as tk
 from tkinter import ttk, messagebox
 
@@ -23,6 +24,7 @@ class AddToolDialog(tk.Toplevel):
         self.transient(parent)
         self.title("Add New Tool")
         self.controller = controller
+        self.result = None
         self.repository = controller.catalog
 
         self.name_var = tk.StringVar()
@@ -44,6 +46,7 @@ class AddToolDialog(tk.Toplevel):
         ttk.Button(button_frame, text="Save", command=self.on_save).pack(side="left", padx=5)
         ttk.Button(button_frame, text="Cancel", command=self.destroy).pack(side="left")
 
+        center_on_workspace(self, parent)
         self.grab_set()
         self.wait_window(self)
 
@@ -56,7 +59,7 @@ class AddToolDialog(tk.Toplevel):
             return
 
         try:
-            self.controller.add_new_tool(name, category)
+            self.result = self.controller.add_new_tool(name, category)
             self.destroy()
         except ValueError as exc:
             messagebox.showerror("Error", str(exc))

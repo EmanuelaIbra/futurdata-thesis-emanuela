@@ -15,10 +15,11 @@ class PropertiesPanel(ttk.Frame):
     - Consistent with JSON schema
     """
 
-    def __init__(self, parent, on_apply_callback: Optional[Callable] = None, data_provider=None):
+    def __init__(self, parent, on_apply_callback: Optional[Callable] = None, data_provider=None, on_add_catalog=None):
         """Initialize the properties panel and build its widgets."""
         super().__init__(parent, padding=10)
         self.on_apply_callback = on_apply_callback
+        self.on_add_catalog = on_add_catalog
         self.current_shape: Optional[Shape] = None
         if data_provider is None:
             raise ValueError("PropertiesPanel requires a controller data_provider")
@@ -35,27 +36,66 @@ class PropertiesPanel(ttk.Frame):
 
     def _create_widgets(self):
         """Create the title, properties frame, apply button and empty label."""
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        self.viewport = tk.Canvas(self, width=300, height=200, highlightthickness=0)
+        self.viewport.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.viewport.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.viewport.configure(yscrollcommand=scrollbar.set)
+        self.content = ttk.Frame(self.viewport)
+        self.content.columnconfigure(0, weight=1)
+        self.content_window = self.viewport.create_window(0, 0, window=self.content, anchor="nw")
+        self.viewport.bind("<Configure>", lambda e: self.viewport.itemconfigure(self.content_window, width=e.width))
+        self.content.bind("<Configure>", lambda e: self.viewport.configure(scrollregion=self.viewport.bbox("all")))
+
         # Title
-        title = ttk.Label(self, text="Properties", font=("Arial", 12, "bold"))
+        title = ttk.Label(self.content, text="Properties", font=("Arial", 12, "bold"))
         title.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
         # Dynamic properties frame - will be populated based on shape type
-        self.properties_frame = ttk.LabelFrame(self, text="Properties", padding=5)
+        self.properties_frame = ttk.LabelFrame(self.content, text="Properties", padding=5)
+
+        self.properties_frame.columnconfigure(1, weight=1)
 
         # Apply button
-        self.apply_button = ttk.Button(self, text="Apply Changes", command=self._on_apply)
+        self.apply_button = ttk.Button(self.content, text="Apply Changes", command=self._on_apply)
         
         # Image preview frame (below apply button)
-        self.image_preview_frame = ttk.LabelFrame(self, text="Image Preview", padding=5)
+        self.image_preview_frame = ttk.LabelFrame(self.content, text="Image Preview", padding=5)
         self.image_label = ttk.Label(self.image_preview_frame, text="No image", foreground="gray")
         self.image_label.pack(pady=5)
 
         # Empty state label
         self.empty_label = ttk.Label(
-            self, text="Select a shape to\nedit its properties", foreground="gray", justify="center"
+            self.content, text="Select a shape to\nedit its properties", foreground="gray", justify="center"
         )
 
         self._show_empty_state()
+
+    @staticmethod
+    def _block_selector_wheel(widget, path):
+        """Stop wheel defaults on this widget only, before class bindings run."""
+        for event in ("<MouseWheel>", "<Shift-MouseWheel>",
+                      "<Button-4>", "<Button-5>",
+                      "<Shift-Button-4>", "<Shift-Button-5>"):
+            widget.tk.call("bind", path, event, "break")
+
+    def _create_combobox(self, parent, **options):
+        widget = ttk.Combobox(parent, **options)
+        self._block_selector_wheel(widget, str(widget))
+
+        def protect_dropdown():
+            # ttk creates its popup in Tcl, so bind its native widget paths.
+            popup = widget.tk.call("ttk::combobox::PopdownWindow", str(widget))
+            pending = [popup]
+            while pending:
+                path = pending.pop()
+                self._block_selector_wheel(widget, path)
+                pending.extend(widget.tk.splitlist(widget.tk.call("winfo", "children", path)))
+
+        widget.configure(postcommand=protect_dropdown)
+        return widget
 
     def _show_empty_state(self):
         """Show empty state when no shape is selected."""
@@ -90,7 +130,7 @@ class PropertiesPanel(ttk.Frame):
 
         # Label (customize for special fields)
         if field_name == 'tool_id':
-            label_text = "Tool / Function:"
+            label_text = "Tool:"
         elif field_name == 'image_path':
             label_text = "Image:"
         elif field_name == 'material_id':
@@ -101,36 +141,20 @@ class PropertiesPanel(ttk.Frame):
 
         # Handle dropdown widget type (from JSON schema)
         if widget_type == 'dropdown' and field_name == 'color_id':
-            # Color dropdown populated from JSON repository
-            colors = self.repository.get_all_colors()
-            color_names = [c['name'] for c in colors]
-            widget = ttk.Combobox(parent, values=color_names, width=22, state="readonly")
+            widget = self._create_combobox(parent, width=22, state="readonly")
             widget.grid(row=row, column=1, sticky="ew", pady=3)
-            # Store color mapping for lookup
-            widget.color_map = {c['name']: c['id'] for c in colors}
-            widget.color_map_reverse = {c['id']: c['name'] for c in colors}
+            self._refresh_catalog_choices(widget, 'color', value)
 
-            # Map color names to hex codes for the UI dropdown
-            widget.color_hex_map = {c['name']: c.get('hex_code', '#ffffff') for c in colors}
-
-            # Set current value by color_id
-            if value and value in widget.color_map_reverse:
-                widget.set(widget.color_map_reverse[value])
-            elif colors:
-                widget.set("")  # Empty by default
-        
         elif widget_type == 'dropdown' and field_name == 'material_id':
             # Material -> Sub Category -> Type selector. The selected type resolves to material_id.
-            materials = self.repository.get_all_materials()
             frame = ttk.Frame(parent)
             frame.grid(row=row, column=1, sticky="ew", pady=3)
             frame.columnconfigure(0, weight=1)
 
-            widget = ttk.Combobox(frame, values=[], width=22, state="readonly")
-            widget.grid(row=0, column=0, sticky="ew")
+            widget = self._create_combobox(frame, values=[], width=22, state="readonly")
+            ttk.Label(frame, text="Category:").grid(row=0, column=0, sticky="w", padx=(0, 6))
+            widget.grid(row=1, column=0, sticky="ew")
             widget.material_selector = True
-            widget.material_rows = materials
-            widget.material_data = {m["id"]: m for m in materials}
 
             widget.category_var = tk.StringVar()
             widget.subcategory_var = tk.StringVar()
@@ -138,45 +162,43 @@ class PropertiesPanel(ttk.Frame):
             widget.configure(textvariable=widget.category_var)
 
             widget.subcategory_frame = ttk.Frame(frame)
-            widget.subcategory_frame.grid(row=1, column=0, sticky="ew", pady=(4, 0))
-            widget.subcategory_frame.columnconfigure(1, weight=1)
-            ttk.Label(widget.subcategory_frame, text="Sub Category:").grid(row=0, column=0, sticky="w", padx=(0, 6))
-            widget.subcategory_combo = ttk.Combobox(
+            widget.subcategory_frame.grid(row=2, column=0, sticky="ew", pady=(4, 0))
+            widget.subcategory_frame.columnconfigure(0, weight=1)
+            ttk.Label(widget.subcategory_frame, text="Sub-Category:").grid(row=0, column=0, sticky="w", padx=(0, 6))
+            widget.subcategory_combo = self._create_combobox(
                 widget.subcategory_frame,
                 textvariable=widget.subcategory_var,
                 state="readonly",
                 width=22,
             )
-            widget.subcategory_combo.grid(row=0, column=1, sticky="ew")
+            widget.subcategory_combo.grid(row=1, column=0, sticky="ew")
 
             widget.type_frame = ttk.Frame(frame)
-            widget.type_frame.grid(row=2, column=0, sticky="ew", pady=(4, 0))
-            widget.type_frame.columnconfigure(1, weight=1)
+            widget.type_frame.grid(row=3, column=0, sticky="ew", pady=(4, 0))
+            widget.type_frame.columnconfigure(0, weight=1)
             ttk.Label(widget.type_frame, text="Type:").grid(row=0, column=0, sticky="w", padx=(0, 6))
-            widget.type_combo = ttk.Combobox(
+            widget.type_combo = self._create_combobox(
                 widget.type_frame,
                 textvariable=widget.type_var,
                 state="readonly",
                 width=22,
             )
-            widget.type_combo.grid(row=0, column=1, sticky="ew")
+            widget.type_combo.grid(row=1, column=0, sticky="ew")
 
             widget.bind("<<ComboboxSelected>>", lambda e, w=widget: self._on_material_category_changed(w))
             widget.subcategory_combo.bind("<<ComboboxSelected>>", lambda e, w=widget: self._on_material_subcategory_changed(w))
 
+            widget.type_combo.bind("<<ComboboxSelected>>", lambda e, w=widget: self._clear_saved_material(w))
+            self._refresh_saved_materials(widget)
             self._setup_material_hierarchy_widget(widget)
 
             if value and int(value) in widget.material_data:
                 self._load_material_hierarchy_from_material(widget, int(value))
 
         elif field_name == 'tool_id':
-            widget = ttk.Entry(parent, width=25)
+            widget = self._create_combobox(parent, width=22, state="readonly")
             widget.grid(row=row, column=1, sticky="ew", pady=3)
-            widget.tool_map_reverse = {
-                tool['id']: tool['name'] for tool in self.repository.get_all_tools()
-            }
-            name = widget.tool_map_reverse.get(value, value)
-            widget.insert(0, str(name) if name is not None else "")
+            self._refresh_catalog_choices(widget, 'tool', value)
 
         elif field_name == 'node_type':
             # Read-only label for node type
@@ -216,7 +238,7 @@ class PropertiesPanel(ttk.Frame):
 
         elif field_name == 'weight_unit':
             # Combobox for weight unit
-            widget = ttk.Combobox(
+            widget = self._create_combobox(
                 parent,
                 values=["g", "kg", "mg", "lb", "oz"],
                 width=22
@@ -289,6 +311,8 @@ class PropertiesPanel(ttk.Frame):
             widget.grid(row=row, column=1, sticky="ew", pady=3)
             widget.insert(0, str(value) if value else "")
 
+        if field_name in ('color_id', 'material_id', 'tool_id') and self.on_add_catalog:
+            self._install_catalog_action(widget, field_name[:-3])
         return widget
 
     def _get_widget_value(self, widget, field_name: str = None) -> Any:
@@ -305,15 +329,106 @@ class PropertiesPanel(ttk.Frame):
             if hasattr(widget, 'material_selector'):
                 return self._get_selected_material_id(widget)
             # Handle color dropdown - return color_id
-            if hasattr(widget, 'color_map') and value in widget.color_map:
-                return widget.color_map[value]
+            if hasattr(widget, 'color_map'):
+                return widget.color_map.get(value)
             # Handle tool dropdown - return tool_id
-            if hasattr(widget, 'tool_map') and value in widget.tool_map:
-                return widget.tool_map[value]
+            if hasattr(widget, 'tool_map'):
+                return widget.tool_map.get(value, value or None)
             return value
         elif isinstance(widget, ttk.Entry):
             return widget.get()
         return None
+
+    def _catalog_choices(self, widget, values):
+        values = list(values)
+        if self.on_add_catalog:
+            label = 'Add new...'
+            while label in values:
+                label += ' (+)'
+            widget.add_new_label = label
+            values.append(label)
+        return values
+
+    def _install_catalog_action(self, widget, kind):
+        variable = getattr(widget, 'category_var', None)
+        if variable is None:
+            variable = tk.StringVar(value=widget.get())
+            widget.configure(textvariable=variable)
+        widget.catalog_variable = variable
+        widget.catalog_previous = variable.get()
+
+        def remember(*args):
+            value = variable.get()
+            if value != widget.add_new_label:
+                widget.catalog_previous = value
+
+        variable.trace_add('write', remember)
+        widget.bind('<<ComboboxSelected>>',
+                    lambda event: self._on_catalog_selection(widget, kind))
+
+    def _on_catalog_selection(self, widget, kind):
+        if widget.get() != widget.add_new_label:
+            if kind == 'material':
+                self._on_material_category_changed(widget)
+            return
+        # Restore the selection before opening the modal dialog. Its save path
+        # refreshes all catalogs, and Cancel must leave the draft intact.
+        widget.set(widget.catalog_previous)
+        selected = self.on_add_catalog(kind)
+        if not widget.winfo_exists():
+            return
+        self.refresh()
+        if selected is not None:
+            if kind == 'material':
+                self._load_material_hierarchy_from_material(widget, selected)
+            else:
+                self._refresh_catalog_choices(widget, kind, selected)
+
+    def _refresh_catalog_choices(self, widget, kind, selected=None):
+        """Read current catalog rows while preserving a selection by its stable ID."""
+        old_names = getattr(widget, f'{kind}_map', {})
+        if selected is None:
+            selected = old_names.get(widget.get(), widget.get())
+        rows = getattr(self.repository, f'get_all_{kind}s')()
+        names = {row['name']: row['id'] for row in rows}
+        reverse = {row['id']: row['name'] for row in rows}
+        setattr(widget, f'{kind}_map', names)
+        setattr(widget, f'{kind}_map_reverse', reverse)
+        if kind == 'color':
+            widget.color_hex_map = {row['name']: row.get('hex_code', '#ffffff') for row in rows}
+        widget['values'] = self._catalog_choices(widget, list(names))
+        label = reverse.get(selected, selected if selected in names else '')
+        # Preserve legacy tool text for display until the user selects a catalog item.
+        if kind == 'tool' and selected and not label and isinstance(selected, str):
+            label = selected
+        widget.set(label)
+
+    def _refresh_saved_materials(self, widget):
+        rows = self.repository.get_all_materials()
+        widget.material_rows = rows
+        widget.material_data = {row['id']: row for row in rows}
+        counts = {}
+        for row in rows:
+            counts[row['name']] = counts.get(row['name'], 0) + 1
+        widget.material_map = {
+            (row['name'] if counts[row['name']] == 1 else f"{row['name']} (#{row['id']})"): row['id']
+            for row in rows
+        }
+
+    def _clear_saved_material(self, widget):
+        widget.selected_material_id = None
+        category_id = widget.category_map.get(widget.category_var.get())
+        widget.category_var.set(widget.category_map_reverse.get(category_id, ''))
+
+    def _on_saved_material_changed(self, widget):
+        material_id = widget.material_map.get(widget.get())
+        if material_id is not None:
+            self._load_material_hierarchy_from_material(widget, material_id)
+        else:
+            self._setup_material_hierarchy_widget(widget)
+            widget.category_var.set('')
+            widget.subcategory_var.set('')
+            widget.type_var.set('')
 
     def _setup_material_hierarchy_widget(self, widget):
         """Configure category/subcategory/type controls for component material selection."""
@@ -321,7 +436,13 @@ class PropertiesPanel(ttk.Frame):
         categories = self.repository.get_all_material_categories()
         widget.category_map = {c["name"]: c["id"] for c in categories}
         widget.category_map_reverse = {c["id"]: c["name"] for c in categories}
-        widget["values"] = [c["name"] for c in categories]
+        # Keep the original hierarchy and expose named materials in the same selector.
+        for label, material_id in widget.material_map.items():
+            material = widget.material_data[material_id]
+            if label not in widget.category_map:
+                widget.category_map[label] = material.get("category_id")
+        widget["values"] = self._catalog_choices(widget, list(dict.fromkeys(
+            [c["name"] for c in categories] + list(widget.material_map))))
         widget.subcategory_map = {}
         widget.subcategory_map_reverse = {}
         widget.type_map = {}
@@ -338,7 +459,8 @@ class PropertiesPanel(ttk.Frame):
 
         widget.selected_material_id = material_id
         category_name = material.get("category_name") or (material.get("name") if material.get("name") in widget.category_map else "")
-        widget.category_var.set(category_name)
+        label = next((name for name, key in widget.material_map.items() if key == material_id), category_name)
+        widget.category_var.set(label)
         self._refresh_material_subcategories(widget, material.get("subcategory_id"))
         self._refresh_material_types(widget, material.get("type_id"))
 
@@ -386,14 +508,18 @@ class PropertiesPanel(ttk.Frame):
             widget.type_frame.grid_remove()
 
     def _on_material_category_changed(self, widget):
-        """When category changes, refresh dependent fields."""
-        widget.selected_material_id = None
+        """Select a named material or refresh the original category hierarchy."""
+        material_id = widget.material_map.get(widget.get())
+        if material_id is not None:
+            self._load_material_hierarchy_from_material(widget, material_id)
+            return
+        self._clear_saved_material(widget)
         self._refresh_material_subcategories(widget)
         self._refresh_material_types(widget)
 
     def _on_material_subcategory_changed(self, widget):
         """When subcategory changes, refresh type field."""
-        widget.selected_material_id = None
+        self._clear_saved_material(widget)
         self._refresh_material_types(widget)
 
     def _get_selected_material_id(self, widget):
@@ -490,7 +616,7 @@ class PropertiesPanel(ttk.Frame):
                 shape.image_path = db_row.get('image_path', shape.image_path)
                 shape.text = shape.name or shape.text
 
-        shape_values['tool_id'] = shape.tools or shape.tool_id or ""
+        shape_values['tool_id'] = shape.tool_id or shape.tools or ""
 
         for row, field in enumerate(fields):
             field_name = field['name']
@@ -726,8 +852,23 @@ class PropertiesPanel(ttk.Frame):
         return ""
 
     def refresh(self):
-        """Reload the properties for the current shape to reflect DB changes."""
-        self.load_shape(self.current_shape)
+        """Refresh catalog options in place without losing unapplied form edits."""
+        for field, widget in self.dynamic_fields.items():
+            if field in ('color_id', 'tool_id'):
+                self._refresh_catalog_choices(widget, field[:-3])
+            elif field == 'material_id':
+                selected = widget.selected_material_id
+                category = widget.category_map.get(widget.category_var.get())
+                subcategory = widget.subcategory_map.get(widget.subcategory_var.get())
+                material_type = widget.type_map.get(widget.type_var.get())
+                self._refresh_saved_materials(widget)
+                self._setup_material_hierarchy_widget(widget)
+                if selected in widget.material_data:
+                    self._load_material_hierarchy_from_material(widget, selected)
+                else:
+                    widget.category_var.set(widget.category_map_reverse.get(category, ''))
+                    self._refresh_material_subcategories(widget, subcategory)
+                    self._refresh_material_types(widget, material_type)
 
     def _get_product_name(self) -> str:
         """Get product name for the current diagram."""

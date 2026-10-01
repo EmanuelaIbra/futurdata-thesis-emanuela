@@ -2,6 +2,8 @@ import tkinter as tk
 from tkinter import font as tkfont
 from ..utils.text_layout import wrap_measured
 from typing import List
+from PIL import Image, ImageOps, ImageTk
+from ..utils.image_handler import get_image_handler
 
 from ..models import Shape, ActionCircle, DiamondStep, ComponentBox, ArrowShape, Connection
 
@@ -36,15 +38,16 @@ class DiagramCanvas(tk.Canvas):
         kwargs.setdefault('bg', 'white')
         kwargs.setdefault('highlightthickness', 0)
         super().__init__(parent, **kwargs)
+        self.zoom_factor = 1.0
         self.canvas_width = self.MIN_CANVAS_WIDTH
         self.canvas_height = self.MIN_CANVAS_HEIGHT
-        self.config(scrollregion=(0, 0, self.canvas_width, self.canvas_height))
+        self.config(scrollregion=(0, 0, self.canvas_width * self.zoom_factor, self.canvas_height * self.zoom_factor))
         self.show_grid = True
         self.snap_to_grid = True
         self.alignment_guides = {'vertical': [], 'horizontal': []}
         self.color_resolver = None
+        self._component_images = {}
         self.draw_grid()
-        self.zoom_factor = 1.0
         self.diagram = None
 
     def expand_canvas_if_needed(self, x: float, y: float, margin: float = 100, redraw_grid: bool = False) -> bool:
@@ -62,7 +65,7 @@ class DiagramCanvas(tk.Canvas):
             expanded = True
 
         if expanded:
-            self.config(scrollregion=(0, 0, self.canvas_width, self.canvas_height))
+            self.config(scrollregion=(0, 0, self.canvas_width * self.zoom_factor, self.canvas_height * self.zoom_factor))
             if redraw_grid:
                 self.draw_grid()
 
@@ -111,8 +114,8 @@ class DiagramCanvas(tk.Canvas):
         shape_y = shape.y
         
         # Get visible area
-        visible_width = self.winfo_width()
-        visible_height = self.winfo_height()
+        visible_width = self.winfo_width() / self.zoom_factor
+        visible_height = self.winfo_height() / self.zoom_factor
         
         if visible_width <= 1 or visible_height <= 1:
             # Canvas not yet rendered, schedule for later
@@ -152,6 +155,27 @@ class DiagramCanvas(tk.Canvas):
         self.xview_moveto(x_fraction)
         self.yview_moveto(y_fraction)
 
+    def center_on_shape(self, shape):
+        """Center a model bounding box using the current viewport transform."""
+        self.update_idletasks()
+        left, top, right, bottom = shape.get_bounds()
+        zoom = self.zoom_factor
+        x0, y0, x1, y1 = map(float, self.tk.splitlist(self.cget('scrollregion')))
+        # Include out-of-region imported geometry without moving model nodes.
+        region = (min(x0, left * zoom - 40), min(y0, top * zoom - 40),
+                  max(x1, right * zoom + 40), max(y1, bottom * zoom + 40))
+        self.configure(scrollregion=region)
+        x0, y0, x1, y1 = region
+        inset = float(self.cget('borderwidth')) + float(self.cget('highlightthickness'))
+        width = max(1, self.winfo_width() - 2 * inset)
+        height = max(1, self.winfo_height() - 2 * inset)
+        target_x = (left + right) * zoom / 2 - width / 2
+        target_y = (top + bottom) * zoom / 2 - height / 2
+        target_x = max(x0, min(target_x, x1 - width))
+        target_y = max(y0, min(target_y, y1 - height))
+        self.xview_moveto((target_x - x0) / max(1, x1 - x0))
+        self.yview_moveto((target_y - y0) / max(1, y1 - y0))
+
     def update_scroll_region_from_shapes(self, shapes) -> None:
         """Updates scroll region to encompass all shapes with padding."""
         if not shapes:
@@ -163,7 +187,7 @@ class DiagramCanvas(tk.Canvas):
             self.canvas_width = max(self.MIN_CANVAS_WIDTH, int(max_x + self.EXPANSION_MARGIN))
             self.canvas_height = max(self.MIN_CANVAS_HEIGHT, int(max_y + self.EXPANSION_MARGIN))
 
-        self.config(scrollregion=(0, 0, self.canvas_width, self.canvas_height))
+        self.config(scrollregion=(0, 0, self.canvas_width * self.zoom_factor, self.canvas_height * self.zoom_factor))
         self.draw_grid()
 
     def draw_grid(self):
@@ -189,6 +213,17 @@ class DiagramCanvas(tk.Canvas):
             lines = wrap_measured(shape.text, width, font.measure)
             shape.HEIGHT = max(ComponentBox.HEIGHT, len(lines) * font.metrics('linespace') + 16)
             text_height = shape.HEIGHT - 16
+            shape._node_image = None
+            image_path = shape.properties.get('image_path')
+            if image_path:
+                try:
+                    with Image.open(get_image_handler().get_full_path(image_path)) as source:
+                        shape._node_image = ImageOps.exif_transpose(source).convert('RGBA')
+                except (OSError, ValueError, Image.DecompressionBombError):
+                    pass  # Unavailable images retain the readable color-only node.
+            if shape._node_image is not None:
+                text_height = len(lines) * font.metrics('linespace')
+                shape.HEIGHT = ComponentBox.HEIGHT + text_height + 16
         else:
             # A centered inscribed rectangle keeps text inside curved/sloped edges.
             size = ActionCircle.RADIUS * 2 if isinstance(shape, ActionCircle) else DiamondStep.SIZE
@@ -238,6 +273,9 @@ class DiagramCanvas(tk.Canvas):
             shape (Shape): The concrete instance model element requiring drawing.
         """
         self._measure_shape(shape)
+        previous_image = self._component_images.pop(shape, None)
+        if previous_image is not None:
+            self.delete(previous_image[0])
         if shape.shape_id is not None:
             self.delete(shape.shape_id)
         if shape.text_id is not None:
@@ -317,18 +355,56 @@ class DiagramCanvas(tk.Canvas):
         if node_type == "leaf" and color_id:
             try:
                 color_data = self.color_resolver(int(color_id)) if self.color_resolver else None
-                if color_data and color_data.get('hex_code'):
-                    fill_color = color_data['hex_code']
+                if color_data:
+                    # The legacy catalog represents Transparent with black RGB.
+                    if str(color_data.get('name', '')).strip().casefold() == 'transparent':
+                        fill_color = ''
+                    elif color_data.get('hex_code'):
+                        fill_color = color_data['hex_code']
             except (TypeError, ValueError):
                 pass  # Fall back to default white for invalid catalog data.
         
+        # Validate catalog colors and choose the higher-contrast black/white label.
+        try:
+            rgb = self.winfo_rgb(fill_color or self.cget('background'))
+            channels = [value / 65535 for value in rgb]
+            linear = [v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4
+                      for v in channels]
+            luminance = sum(v * weight for v, weight in zip(linear, (0.2126, 0.7152, 0.0722)))
+            text_color = "black" if luminance > 0.179 else "white"
+        except (tk.TclError, TypeError, ValueError):
+            fill_color, text_color = self.COMPONENT_FILL, "black"
+
+        source = shape._node_image
+        label_y = shape.y
+        if source is not None:
+            fill_color, text_color = "white", "black"
+            label_y = y2 - (shape._text_height + 16) / 2
         shape.shape_id = self.create_rectangle(
             x1, y1, x2, y2, fill=fill_color, outline=border_color, width=border_width, tags="shape"
         )
+        if source is not None:
+            inset = 2
+            width = x2 - x1 - inset * 2
+            height = ComponentBox.HEIGHT - inset
+            photo = self._component_photo(source, width, height)
+            item = self.create_image(shape.x, y1 + inset + height / 2,
+                                     image=photo, tags="shape")
+            self._component_images[shape] = (item, source, width, height, photo)
         shape.text_id = self.create_text(
-            shape.x, shape.y, text=shape._display_text, font=("Arial", 9), fill="black",
+            shape.x, label_y, text=shape._display_text, font=("Arial", 9), fill=text_color,
             width=0, tags="shape_text"
         )
+
+    def _component_photo(self, source, width, height):
+        """Fit the whole image proportionally on an opaque, neutral background."""
+        size = (max(1, round(width * self.zoom_factor)),
+                max(1, round(height * self.zoom_factor)))
+        fitted = ImageOps.contain(source, size, Image.Resampling.LANCZOS)
+        background = Image.new('RGBA', size, 'white')
+        background.alpha_composite(fitted, ((size[0] - fitted.width) // 2,
+                                            (size[1] - fitted.height) // 2))
+        return ImageTk.PhotoImage(background, master=self)
 
     def _draw_arrow_shape(self, shape: ArrowShape):
         """
@@ -388,6 +464,7 @@ class DiagramCanvas(tk.Canvas):
 
     def clear_canvas(self):
         """Removes core visual entities including shapes, text strings, linkages, and alignment markers."""
+        self._component_images.clear()
         self.delete("shape")
         self.delete("shape_text")
         self.delete("connection")
@@ -413,6 +490,7 @@ class DiagramCanvas(tk.Canvas):
         self._layout_shapes(diagram)
 
         # Clear existing elements and reset background grid
+        self._component_images.clear()
         self.delete("all")
         self.draw_grid()
         
@@ -422,10 +500,6 @@ class DiagramCanvas(tk.Canvas):
         for conn in diagram.connections:
             self.draw_connection(conn)
 
-        # Reapply current zoom scale if a transformation is active    
-        if self.zoom_factor != 1.0:
-            self.scale("all", 0, 0, self.zoom_factor, self.zoom_factor)
-            self._scale_labels()
 
 
     def update_shape(self, shape: Shape):
@@ -451,6 +525,11 @@ class DiagramCanvas(tk.Canvas):
 
     def move_items(self, shape: Shape, dx: float, dy: float):
         """Move shape's canvas items by dx, dy - much faster than redrawing."""
+        image = self._component_images.get(shape)
+        if image is not None:
+            self.move(image[0], dx * self.zoom_factor, dy * self.zoom_factor)
+        dx *= self.zoom_factor
+        dy *= self.zoom_factor
         if shape.shape_id is not None:
             self.move(shape.shape_id, dx, dy)
         if shape.text_id is not None:
@@ -458,6 +537,9 @@ class DiagramCanvas(tk.Canvas):
 
     def update_connections_for_shapes(self, shapes: List[Shape], diagram):
         """Update only connections attached to the given shapes."""
+        for arrow in diagram.shapes:
+            if isinstance(arrow, ArrowShape) and (arrow.from_shape in shapes or arrow.to_shape in shapes):
+                self.draw_shape(arrow)
         for conn in diagram.connections:
             if conn.from_shape in shapes or conn.to_shape in shapes:
                 self.draw_connection(conn)
@@ -470,13 +552,13 @@ class DiagramCanvas(tk.Canvas):
         else:
             self.delete("grid")
 
-    def zoom_in(self):
+    def zoom_in(self, x=None, y=None):
         """Increases the current zoom level by scaling all objects up by 10% ."""
-        self._apply_zoom(1.1)
+        self._apply_zoom(1.1, x, y)
 
-    def zoom_out(self):
+    def zoom_out(self, x=None, y=None):
         """Decreases the current zoom level by scaling all objects down by 10% ."""
-        self._apply_zoom(0.9)
+        self._apply_zoom(1 / 1.1, x, y)
 
     def reset_zoom(self):
         """
@@ -511,31 +593,56 @@ class DiagramCanvas(tk.Canvas):
                 font.configure(size=-pixels)
             self.itemconfigure(shape.text_id, font=("Arial", -pixels), width=0)
 
-    def _apply_zoom(self, factor: float):
-        """
-        Applies mathematical scaling to all graphical items in the canvas.
+    def model_x(self, x):
+        return self.canvasx(x) / self.zoom_factor
 
-        Args:
-            factor (float): The multiplier to apply to the current zoom.
+    def model_y(self, y):
+        return self.canvasy(y) / self.zoom_factor
 
-        Note:
-            Handles scroll region recalculation, grid adjustment, and
-            uses the native Tkinter .scale() method with (0,0) as the anchor.
-        """
-        next_zoom = self.zoom_factor * factor
-        if not (0.4 <= next_zoom <= 3.0) and factor != (1.0 / self.zoom_factor):
+    def _create(self, item_type, args, kw):
+        """Render model coordinates through the viewport transform, including previews."""
+        from tkinter import _flatten
+        args = tuple(value * self.zoom_factor for value in _flatten(args))
+        kw = dict(kw)
+        for option in ('width', 'activewidth', 'disabledwidth'):
+            if option in kw:
+                kw[option] *= self.zoom_factor
+        if kw.get('arrow'):
+            kw['arrowshape'] = tuple(v * self.zoom_factor for v in kw.get('arrowshape', (8, 10, 3)))
+        if kw.get('dash'):
+            kw['dash'] = tuple(max(1, round(v * self.zoom_factor)) for v in kw['dash'])
+        if 'font' in kw:
+            family, points = kw['font']
+            kw['font'] = (family, -max(1, round(self.winfo_fpixels(f'{points}p') * self.zoom_factor)))
+        return super()._create(item_type, args, kw)
+
+    def _apply_zoom(self, factor: float, x=None, y=None):
+        """Zoom only the viewport, keeping the model point under the cursor stable."""
+        next_zoom = min(4.0, max(0.25, self.zoom_factor * factor))
+        factor = next_zoom / self.zoom_factor
+        if factor == 1:
             return
-
+        x = self.winfo_width() / 2 if x is None else x
+        y = self.winfo_height() / 2 if y is None else y
+        anchor_x, anchor_y = self.canvasx(x), self.canvasy(y)
         self.zoom_factor = next_zoom
-
-       
-        self.scale("all", 0, 0, factor, factor)
+        self.scale('all', 0, 0, factor, factor)
+        for item in self.find_all():
+            if self.type(item) not in ('text', 'image'):
+                self.itemconfigure(item, width=float(self.itemcget(item, 'width')) * factor)
+            if self.type(item) == 'line' and self.itemcget(item, 'dash'):
+                base = 4 if 'guide' in self.gettags(item) else 5
+                self.itemconfigure(item, dash=(max(1, round(base * next_zoom)),) * 2)
+            if self.type(item) == 'line' and self.itemcget(item, 'arrow') != 'none':
+                arrow = self.tk.splitlist(self.itemcget(item, 'arrowshape'))
+                self.itemconfigure(item, arrowshape=tuple(float(v) * factor for v in arrow))
+        for shape, (item, source, image_width, image_height, _) in list(self._component_images.items()):
+            photo = self._component_photo(source, image_width, image_height)
+            self.itemconfigure(item, image=photo)
+            self._component_images[shape] = (item, source, image_width, image_height, photo)
         self._scale_labels()
-        
-       
-        self.canvas_width = int(self.canvas_width * factor)
-        self.canvas_height = int(self.canvas_height * factor)
-        self.config(scrollregion=(0, 0, self.canvas_width, self.canvas_height))
-        
-        
+        width, height = self.canvas_width * next_zoom, self.canvas_height * next_zoom
+        self.config(scrollregion=(0, 0, width, height))
+        self.xview_moveto((anchor_x * factor - x) / width)
+        self.yview_moveto((anchor_y * factor - y) / height)
         self.draw_grid()

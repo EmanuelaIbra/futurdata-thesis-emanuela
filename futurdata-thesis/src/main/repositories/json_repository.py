@@ -38,7 +38,7 @@ class JsonRepository:
     )
 
     def __init__(self, file_path: str | None = None):
-        app_dir = Path("D:/.disassembly_diagram")
+        app_dir = Path.home()
         self.file_path = Path(file_path) if file_path else app_dir / "ariadne_data.json"
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = RLock()
@@ -618,10 +618,7 @@ class JsonRepository:
         for col in self.get_table_schema(table):
             if col["name"] in exclude:continue
             col["display_name"]=col["name"].replace("_"," ").title()
-            if col["name"] in {"color_id","material_id"}: col["widget_type"]="dropdown"; col["display_name"]={"color_id":"Color","material_id":"Material","tool_id":"Tool"}[col["name"]]
-            if col["name"] == "tool_id":
-                col["widget_type"] = "text"
-                col["display_name"] = "Tool / Function"
+            if col["name"] in {"color_id","material_id","tool_id"}: col["widget_type"]="dropdown"; col["display_name"]={"color_id":"Color","material_id":"Material","tool_id":"Tool"}[col["name"]]
             out.append(col)
         return out
     def get_component_fields(self,component_kind="intermediate"):

@@ -4,6 +4,7 @@ from typing import Optional
 
 from .canvas_view import DiagramCanvas
 from .properties_panel import PropertiesPanel
+from .navigator import Navigator
 
 
 class MainWindow:
@@ -27,13 +28,15 @@ class MainWindow:
         self.root = root
         self.controller = controller
         self.root.title("ARIADNE Disassembly Workflow Builder")
-        self.root.geometry("1400x800")
-        self.root.minsize(1000, 600)
+        width = min(1400, int(self.root.winfo_screenwidth() * 0.9))
+        height = min(800, int(self.root.winfo_screenheight() * 0.85))
+        self.root.geometry(f"{width}x{height}")
+        self.root.minsize(min(640, width), min(400, height))
 
         self._create_menu()
         self._create_toolbar()
-        self._create_main_area()
         self._create_status_bar()
+        self._create_main_area()
         self._bind_shortcuts()
         self.update_ui_state()
 
@@ -81,6 +84,7 @@ class MainWindow:
         edit_menu.add_separator()
         edit_menu.add_command(label="Manage Colors...", command=self.controller.show_manage_colors_dialog)
         edit_menu.add_command(label="Manage Materials...", command=self.controller.show_manage_materials_dialog)
+        edit_menu.add_command(label="Manage Tools...", command=self.controller.show_manage_tools_dialog)
         edit_menu.add_separator()
         edit_menu.add_command(label="Clear Canvas", command=self.controller.clear_canvas)
 
@@ -131,6 +135,24 @@ class MainWindow:
         )
 
         self.snap_btn.pack(side="left", padx=2)
+        for label, command in (("Zoom +", self.controller.zoom_in), ("Zoom -", self.controller.zoom_out), ("100%", self.controller.reset_zoom)):
+            ttk.Button(toolbar, text=label, width=7, command=command).pack(side="left", padx=2)
+        controls = list(toolbar.winfo_children())
+        for widget in controls:
+            widget.pack_forget()
+        def wrap_toolbar(event):
+            row, column, used = 0, 0, 0
+            row_height = max(w.winfo_reqheight() for w in controls) + 4
+            for widget in controls:
+                width = widget.winfo_reqwidth() + 4
+                if used and used + width > event.width - 10:
+                    row, column, used = row + 1, 0, 0
+                widget.place(x=used + 2, y=row * row_height + 2)
+                column += 1
+                used += width
+            toolbar.configure(height=(row + 1) * row_height + 10)
+        toolbar.bind("<Configure>", wrap_toolbar)
+
 
     def _create_main_area(self):
         """
@@ -142,9 +164,17 @@ class MainWindow:
         main_frame = ttk.Frame(self.root)
         main_frame.pack(side="top", fill="both", expand=True)
 
-        palette_frame = ttk.LabelFrame(main_frame, text="Shape Palette", padding=10, width=150)
-        palette_frame.pack(side="left", fill="y", padx=(5, 0), pady=5)
-        palette_frame.pack_propagate(False)
+        self.paned_window = ttk.PanedWindow(main_frame, orient="horizontal")
+        self.paned_window.pack(fill="both", expand=True, padx=5, pady=5)
+        sidebar = ttk.Frame(self.paned_window, width=150)
+        sidebar.pack_propagate(False)
+        self.sidebar_tabs = ttk.Notebook(sidebar)
+        self.sidebar_tabs.pack(fill="both", expand=True)
+        palette_frame = ttk.Frame(self.sidebar_tabs, padding=6)
+        self.sidebar_tabs.add(palette_frame, text="Shapes")
+        self.navigator = Navigator(self.sidebar_tabs, self.controller.navigate_to_shape)
+        self.sidebar_tabs.add(self.navigator, text="Navigator")
+        self.paned_window.add(sidebar, weight=0)
 
         ttk.Label(palette_frame, text="Click to add:").pack(anchor="w", pady=(0, 10))
         ttk.Button(palette_frame, text="▭ Root Component", command=lambda: self.controller.add_shape("component_root")).pack(fill="x", pady=2)
@@ -154,10 +184,7 @@ class MainWindow:
         ttk.Button(palette_frame, text="◇ Action", command=lambda: self.controller.add_shape("diamond")).pack(fill="x", pady=2)
         ttk.Button(palette_frame, text="→ Arrow", command=lambda: self.controller.add_shape("arrow")).pack(fill="x", pady=2)
 
-        self.paned_window = ttk.PanedWindow(main_frame, orient="horizontal")
-        self.paned_window.pack(side="left", fill="both", expand=True, padx=5, pady=5)
-
-        canvas_frame = ttk.Frame(main_frame)
+        canvas_frame = ttk.Frame(self.paned_window, width=200)
 
         h_scroll = ttk.Scrollbar(canvas_frame, orient="horizontal", command=lambda *args: self.canvas_view_scroll_x if hasattr(self, 'canvas_view_scroll_x') else None)
         h_scroll.pack(side="bottom", fill="x")
@@ -165,7 +192,7 @@ class MainWindow:
         v_scroll = ttk.Scrollbar(canvas_frame, orient="vertical")
         v_scroll.pack(side="right", fill="y")
 
-        self.canvas = DiagramCanvas(canvas_frame, bg="white")
+        self.canvas = DiagramCanvas(canvas_frame, bg="white", width=200, height=200)
         self.canvas.color_resolver = self.controller.catalog.get_color
         self.canvas.pack(side="left", fill="both", expand=True)
 
@@ -178,10 +205,11 @@ class MainWindow:
         self.properties_panel = PropertiesPanel(
             self.paned_window,
             on_apply_callback=self.controller.apply_properties,
+            on_add_catalog=self.controller.show_add_catalog_dialog,
             data_provider=self.controller.catalog,
         )
 
-        self.paned_window.add(self.properties_panel, weight=1)
+        self.paned_window.add(self.properties_panel, weight=0)
 
     def _create_status_bar(self):
         """
@@ -315,6 +343,15 @@ class MainWindow:
         transaction or manual properties injection.
         """
         self.properties_panel.refresh()
+        # Existing controller callbacks also update any open catalog dialogs.
+        def refresh_dialogs(parent):
+            for child in parent.winfo_children():
+                if isinstance(child, tk.Toplevel):
+                    refresh = getattr(child, 'refresh_catalogs', None)
+                    if refresh is not None:
+                        refresh()
+                    refresh_dialogs(child)
+        refresh_dialogs(self.root)
 
     def show_about(self):
         """

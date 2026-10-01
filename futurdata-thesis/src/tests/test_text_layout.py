@@ -95,7 +95,7 @@ def test_native_canvas_grows_and_keeps_text_inside_shape(kind):
 
 
 @pytest.mark.parametrize('groups', [1, 4])
-def test_pptx_overflow_keeps_all_text_in_readable_continuations(tmp_path, groups):
+def test_pptx_long_text_stays_on_original_slides(tmp_path, groups):
     long_action = 'BODY_START ' + 'W' * 2500 + ' BODY_END'
     tools = ['tool_' + str(i) for i in range(35)]
     outputs = [{'node_id': i + 2, 'name': 'part_' + str(i)} for i in range(12)]
@@ -116,16 +116,15 @@ def test_pptx_overflow_keeps_all_text_in_readable_continuations(tmp_path, groups
                 texts.append(shape.text)
                 for paragraph in shape.text_frame.paragraphs:
                     for run in paragraph.runs:
-                        assert run.font.size.pt >= 8
+                        assert run.font.size.pt >= 1
             if shape.has_table:
                 texts.extend(cell.text for row in shape.table.rows for cell in row.cells)
     text = re.sub(r'\s+', '', ''.join(texts))
-    # The content may span slides; headers/footers separate chunks, so test the
-    # complete retained original via the pagination queue as well as sentinels.
-    assert any(value == long_action for _, _, value in exporter._overflow)
+    assert re.sub(r'\s+', '', long_action) in text
     assert 'BODY_START' in text and 'BODY_END' in text
     assert 'tool_34' in text and 'Part_11' in text and '_end' in text
-    assert 'Details[' in text
+    assert 'Details[' not in text
+    assert 'CONTINUEDTEXT' not in text
 
 
 def test_docx_table_wraps_without_changing_long_url(tmp_path, export_diagram):
@@ -174,3 +173,32 @@ def test_markdown_long_labels_keep_breaks_out_of_link_targets():
     assert '<wbr>' in escape_cell(label)
     path = 'https://example.test/' + 'a' * 200
     assert image(label, path).endswith('](' + path + ')')
+
+
+@pytest.mark.parametrize('include_closing', [True, False])
+def test_pptx_has_no_detail_pages_and_closing_is_last(tmp_path, include_closing):
+    data = {'product': {'name': 'Long product ' + 'P' * 1200}, 'steps': [
+        {'index': 1, 'operation': 'First operation', 'actions': [{'text': 'FIRST_START ' + 'W' * 2500 + ' FIRST_END'}]},
+        {'index': 2, 'operation': 'Second operation', 'actions': [{'text': 'SECOND_START ' + 'Z' * 2500 + ' SECOND_END'}]}]}
+    exporter = PPTXExporter()
+    path = exporter.export(WizardDocument.from_any(data), tmp_path / 'ordered.pptx',
+                           ExportOptions(include_closing=include_closing))
+    presentation = Presentation(path)
+    slides = [' '.join(shape.text for shape in slide.shapes if shape.has_text_frame)
+              for slide in presentation.slides]
+    if include_closing:
+        assert 'EXPORT COMPLETE' in slides[-1]
+        assert all('EXPORT COMPLETE' not in text for text in slides[:-1])
+    else:
+        assert all('EXPORT COMPLETE' not in text for text in slides)
+    assert all('CONTINUED TEXT' not in text and 'Details [' not in text for text in slides)
+    # Text length must not add separate detail slides to the deck.
+    short_data = {'product': {'name': 'Product'}, 'steps': [
+        {'index': 1, 'operation': 'First operation', 'actions': [{'text': 'First action'}]},
+        {'index': 2, 'operation': 'Second operation', 'actions': [{'text': 'Second action'}]}]}
+    short_path = exporter.export(WizardDocument.from_any(short_data), tmp_path / 'short.pptx',
+                                 ExportOptions(include_closing=include_closing))
+    assert len(presentation.slides) == len(Presentation(short_path).slides)
+    full_text = ''.join(slides).replace('\n', '').replace('\v', '')
+    for marker in ('FIRST_START', 'FIRST_END', 'SECOND_START', 'SECOND_END'):
+        assert marker in full_text

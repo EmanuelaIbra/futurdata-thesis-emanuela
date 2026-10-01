@@ -9,6 +9,7 @@ from uuid import uuid4
 from ..repositories import get_repository, DuplicateValueError
 from ..services import ProjectArchiveService
 from .catalog_controller import CatalogController
+from .navigator import topology_snapshot, build_outline
 from ..views.add_color_dialog import AddColorDialog
 from ..views.add_material_dialog import AddMaterialDialog
 from ..views.add_tool_dialog import AddToolDialog
@@ -22,6 +23,7 @@ from ..utils.json_exporter import EnhancedJSONExporter
 from ..services.document_export_service import DocumentExportService
 from ..views.manage_colors_dialog import ManageColorsDialog
 from ..views.manage_materials_dialog import ManageMaterialsDialog
+from ..views.manage_tools_dialog import ManageToolsDialog
 
 
 class AppController:
@@ -54,6 +56,7 @@ class AppController:
         """Attach the view and wire up canvas event bindings."""
         self.view = view
         self._bind_canvas_events()
+        self._sync_navigator()
 
     def _bind_canvas_events(self):
         """Bind mouse, keyboard and scroll events to the canvas."""
@@ -68,6 +71,15 @@ class AppController:
         canvas.bind("<Button-4>", self.on_mouse_wheel)
         canvas.bind("<Button-5>", self.on_mouse_wheel)
         canvas.bind("<Shift-MouseWheel>", self.on_shift_mouse_wheel)
+        for sequence in ("<Control-MouseWheel>", "<Control-Button-4>", "<Control-Button-5>"):
+            canvas.bind(sequence, self.on_zoom_wheel)
+
+    def on_zoom_wheel(self, event):
+        direction = 1 if getattr(event, 'num', None) == 4 or getattr(event, 'delta', 0) > 0 else -1
+        self.view.canvas._apply_zoom(1.1 ** direction, event.x, event.y)
+        self.view.set_status(f"Zoom: {self.view.canvas.zoom_factor:.0%}")
+        return "break"
+
 
     def on_mouse_wheel(self, event):
         """Scroll the canvas vertically with the mouse wheel."""
@@ -85,8 +97,8 @@ class AppController:
     def on_canvas_motion(self, event):
         """Show preview line when in arrow/connect mode and have a starting shape."""
         if (self.arrow_mode or self.connect_mode) and self.connecting_from is not None:
-            x = self.view.canvas.canvasx(event.x)
-            y = self.view.canvas.canvasy(event.y)
+            x = self.view.canvas.model_x(event.x)
+            y = self.view.canvas.model_y(event.y)
             # Draw preview line from connecting_from shape to mouse cursor
             self._update_preview_line(self.connecting_from.x, self.connecting_from.y, x, y)
 
@@ -121,8 +133,8 @@ class AppController:
 
     def on_canvas_click(self, event):
         """Handle left-click: select a shape, start a drag, or start a connection."""
-        x = self.view.canvas.canvasx(event.x)
-        y = self.view.canvas.canvasy(event.y)
+        x = self.view.canvas.model_x(event.x)
+        y = self.view.canvas.model_y(event.y)
         clicked_shape = self.diagram.find_shape_at_point(x, y)
 
         if self.arrow_mode:
@@ -156,8 +168,8 @@ class AppController:
 
         self._auto_scroll_viewport(event.x, event.y)
 
-        x = self.view.canvas.canvasx(event.x)
-        y = self.view.canvas.canvasy(event.y)
+        x = self.view.canvas.model_x(event.x)
+        y = self.view.canvas.model_y(event.y)
         dx = x - self.drag_start[0]
         dy = y - self.drag_start[1]
 
@@ -244,8 +256,8 @@ class AppController:
 
     def on_canvas_right_click(self, event):
         """Show the context menu for the shape under the cursor."""
-        x = self.view.canvas.canvasx(event.x)
-        y = self.view.canvas.canvasy(event.y)
+        x = self.view.canvas.model_x(event.x)
+        y = self.view.canvas.model_y(event.y)
         clicked_shape = self.diagram.find_shape_at_point(x, y)
 
         if clicked_shape:
@@ -595,8 +607,23 @@ class AppController:
         self.diagram.select_shape(shape, multi_select=False)
         self._update_view()
 
+    def _allow_new_root(self):
+        if any(isinstance(shape, ComponentBox) and
+               str(shape.properties.get('node_type', '')).strip().lower() == 'root'
+               for shape in self.diagram.shapes):
+            self.view.show_error(
+                "Root component already exists",
+                "This diagram already has a Root Component. Only one root is allowed.\n\n"
+                "Add a Leaf or Composite Component, or create a new diagram for another root.")
+            return False
+        return True
+
     def _duplicate_shape(self, shape):
         """Create a copy of a shape offset from the original."""
+        if (isinstance(shape, ComponentBox) and
+                str(shape.properties.get('node_type', '')).strip().lower() == 'root' and
+                not self._allow_new_root()):
+            return
         new_shape = self._create_shape_instance(shape.shape_type, shape.x + 50, shape.y + 50)
         new_shape.text = shape.text
 
@@ -676,6 +703,9 @@ class AppController:
         if shape_type == "product":
             shape_type = "component_root"
 
+        if shape_type == "component_root" and not self._allow_new_root():
+            return
+
         if shape_type == "arrow":
             self.arrow_mode = True
             self.connecting_from = None
@@ -735,8 +765,8 @@ class AppController:
         visible_y1 = y_view[0] * canvas_height
         
         # Place shape in center of visible area with stagger
-        center_x = visible_x1 + (visible_width / 2)
-        center_y = visible_y1 + (visible_height / 2)
+        center_x = visible_x1 + (visible_width / (2 * self.view.canvas.zoom_factor))
+        center_y = visible_y1 + (visible_height / (2 * self.view.canvas.zoom_factor))
         
         # Add stagger based on recent shapes (last 10)
         recent_shapes = self.diagram.shapes[-10:]
@@ -817,21 +847,47 @@ class AppController:
     def apply_properties(self, shape, old_properties, new_properties):
         """Apply edited properties to a shape and persist them to the storage."""
         command = EditShapePropertiesCommand(shape, old_properties, new_properties)
+        json_only = bool(self.diagram.file_path and self.diagram.auto_sync_json)
+        # The Properties view has already collected edits into the model. Do
+        # not record a successful command until persistence accepts them.
+        id_fields = ('db_step_id', 'db_action_id', 'db_step_action_id', 'db_action_order', 'tool_id')
+        states = [(node, copy.deepcopy(node.properties) if isinstance(node, ComponentBox) else
+                   {key: getattr(node, key, None) for key in id_fields})
+                  for node in self.diagram.shapes]
+        old_product = getattr(self, 'current_product_id', None)
+        try:
+            command.execute()
+            if not json_only:
+                with self.repository.transaction():
+                    self._persist_shape_properties(shape)
+        except (ValueError, OSError) as exc:
+            self.current_product_id = old_product
+            for node, state in states:
+                if isinstance(node, ComponentBox):
+                    node.properties = state
+                else:
+                    for key, value in state.items():
+                        setattr(node, key, value)
+            command.undo()
+            self.view.show_error("Cannot apply changes", str(exc))
+            self.view.set_status("Changes were not saved. Correct the values and try again.")
+            return False
+
+        # Persistence may assign IDs or normalize optional values. Preserve
+        # those values when the command is executed/recorded by the history.
+        if isinstance(shape, ComponentBox):
+            command.new_properties = {**new_properties, **shape.properties}
+        elif isinstance(shape, DiamondStep):
+            command.new_properties = {**new_properties, 'tool_id': shape.tool_id}
         self.command_history.execute(command)
-        
-        # Check source: JSON or JSON storage
-        if self.diagram.file_path and self.diagram.auto_sync_json:
-            # Loaded from JSON → Save to JSON only
-            self.diagram.select_shape(shape, multi_select=False)
-            self._update_view()
+        self.diagram.select_shape(shape, multi_select=False)
+        self._update_view()
+        if json_only:
             self.view.set_status("Properties updated (saving to JSON...)")
             self._schedule_auto_save_json()
         else:
-            # Loaded from JSON storage → Save to JSON storage only
-            self._persist_shape_properties(shape)
-            self.diagram.select_shape(shape, multi_select=False)
-            self._update_view()
             self.view.set_status("Properties updated (saved to JSON storage)")
+        return True
 
     def _persist_diagram(self):
         """Atomically persist one owned diagram and its complete editable graph."""
@@ -864,6 +920,11 @@ class AppController:
     def _persist_shape_properties(self, shape):
         """Persist edited shape properties through the JSON repository."""
         if isinstance(shape, ComponentBox):
+            # Older forms/projects may contain empty strings for optional IDs.
+            for field in ('color_id', 'material_id'):
+                value = shape.properties.get(field)
+                if isinstance(value, str) and not value.strip():
+                    shape.properties[field] = None
             component_id = self._ensure_component_id(shape)
             updates = dict(shape.properties)
             for internal_key in ("db_id", "root_component_id", "diagram_id", "_material_category_id", "_material_subcategory_id", "_material_type_id"):
@@ -884,10 +945,12 @@ class AppController:
 
         if isinstance(shape, DiamondStep):
             action_id = self._ensure_action_id(shape)
-            if shape.tools:
+            if not shape.tool_id and shape.tools:
+                # Keep existing free-text diagrams saveable; catalog selections
+                # already carry an ID and must not create another tool.
                 shape.tool_id = self.repository.create_tool(str(shape.tools))
-            # Legacy files may carry only an ID. Clearing the entry explicitly
-            # clears both tools and tool_id in the properties panel.
+                if getattr(self, "view", None) is not None:
+                    self.view.refresh_properties_panel()
             self.repository.update_action(
                 int(action_id), name=str(shape.name or shape.text or "").strip(),
                 description=str(shape.description or "").strip(),
@@ -1085,7 +1148,7 @@ class AppController:
 
     def show_add_color_dialog(self):
         """Open the dialog for adding a new color."""
-        AddColorDialog(self.view.root, self)
+        return AddColorDialog(self.view.root, self).result
 
    
 
@@ -1097,6 +1160,27 @@ class AppController:
     def show_manage_materials_dialog(self):
         """Open the dialog for managing materials."""
         ManageMaterialsDialog(self.view.root, self)
+
+    def show_add_catalog_dialog(self, kind):
+        return {'color': self.show_add_color_dialog,
+                'material': self.show_add_material_dialog,
+                'tool': self.show_add_tool_dialog}[kind]()
+
+    def show_manage_tools_dialog(self):
+        ManageToolsDialog(self.view.root, self)
+
+    def delete_tool(self, tool_id):
+        # Protect unsaved diagrams as well as references in repository records.
+        if any(isinstance(shape, DiamondStep) and shape.tool_id == tool_id
+               for shape in getattr(getattr(self, 'diagram', None), 'shapes', [])):
+            raise ValueError("The tool cannot be deleted because it is assigned to an action.")
+        try:
+            success = self.repository.delete_tool(tool_id)
+        except ValueError as exc:
+            raise ValueError("The tool cannot be deleted because it is assigned to an action.") from exc
+        if success:
+            self.view.refresh_properties_panel()
+        return success
 
     def add_new_color(self, name, hex_code, r, g, b):
         try:
@@ -1123,7 +1207,7 @@ class AppController:
 
     def show_add_material_dialog(self):
         """Open the dialog for adding a new material."""
-        AddMaterialDialog(self.view.root, self)
+        return AddMaterialDialog(self.view.root, self).result
 
     def add_new_material_category(self, name):
         try:
@@ -1183,7 +1267,7 @@ class AppController:
 
     def show_add_tool_dialog(self):
         """Open the dialog for adding a new tool."""
-        AddToolDialog(self.view.root, self)
+        return AddToolDialog(self.view.root, self).result
 
     def add_new_tool(self, name, category):
         try:
@@ -1233,6 +1317,39 @@ class AppController:
         except Exception:
             pass
 
+    def _sync_navigator(self):
+        navigator = getattr(self.view, 'navigator', None)
+        if navigator is None:
+            return
+        snapshot = topology_snapshot(self.diagram)
+        owner = (id(self.diagram), self.diagram.diagram_id)
+        changed_owner = getattr(self, '_navigator_owner', None) != owner
+        if changed_owner or getattr(self, '_navigator_snapshot', None) != snapshot:
+            navigator.show_rows(build_outline(snapshot), reset=changed_owner)
+            self._navigator_owner = owner
+            self._navigator_snapshot = snapshot
+        navigator.select_shapes([shape.id for shape in self.diagram.selected_shapes])
+
+    def navigate_to_shape(self, shape_id):
+        """Use normal model selection, without running geometry/layout edits."""
+        shape = self.diagram.get_shape_by_id(shape_id)
+        if shape is None:
+            self._sync_navigator()
+            return
+        self.on_escape(None)
+        self.dragging = False
+        self.drag_shapes = []
+        self.drag_initial_positions = {}
+        self.drag_start = None
+        previous = list(self.diagram.selected_shapes)
+        self.diagram.select_shape(shape)
+        for affected in dict.fromkeys(previous + [shape]):
+            self.view.canvas.draw_shape(affected)
+        self.view.update_properties_panel(shape)
+        self._sync_navigator()
+        self.view.canvas.center_on_shape(shape)
+        self.view.update_ui_state()
+
     def _update_view(self):
         """Redraw the canvas and sync the properties panel with the selection."""
         self.view.canvas.redraw_all(self.diagram)
@@ -1245,6 +1362,7 @@ class AppController:
         else:
             self.view.update_properties_panel(None)
 
+        self._sync_navigator()
         self.view.update_ui_state()
     
     # ==================== NEW: PRODUCT LIST & LOAD ====================
