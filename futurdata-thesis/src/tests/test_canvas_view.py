@@ -185,7 +185,7 @@ class CanvasViewTests(unittest.TestCase):
         invokes the creation of both an oval and its label text."""
         shape = MagicMock(spec=ActionCircle)
         shape.x, shape.y, shape.text = 100, 100, "Action"
-        shape.selected, shape.shape_id, shape.text_id = False, None, None
+        shape.selected = False
         shape.get_bounds = MagicMock(return_value=(50, 50, 150, 150))
         
         self.canvas.draw_shape(shape)
@@ -198,7 +198,7 @@ class CanvasViewTests(unittest.TestCase):
         shape = MagicMock(spec=DiamondStep)
         shape.x, shape.y, shape.text = 100, 100, "Decision"
         shape.SIZE = 80
-        shape.selected, shape.shape_id, shape.text_id = False, None, None
+        shape.selected = False
         
         self.canvas.draw_shape(shape)
         self.mock_create_poly.assert_called_once()
@@ -209,7 +209,7 @@ class CanvasViewTests(unittest.TestCase):
         with the specified custom hex color property."""
         shape = ComponentBox(0, 0)
         shape.x, shape.y, shape.text = 100, 100, "Component"
-        shape.selected, shape.shape_id, shape.text_id = False, None, None
+        shape.selected = False
         shape.get_bounds = MagicMock(return_value=(50, 50, 150, 150))
         shape.properties = {'color_id': 1, 'node_type': 'Leaf'}
         self.canvas.color_resolver = MagicMock(return_value={'hex_code': '#ff00ff'})
@@ -224,8 +224,8 @@ class CanvasViewTests(unittest.TestCase):
         correctly triggers the line creation on the canvas."""
         shape = MagicMock(spec=ArrowShape)
         shape.x, shape.y, shape.end_x, shape.end_y = 100, 100, 200, 200
-        shape.selected, shape.shape_id, shape.text_id = False, None, None
-        shape.from_shape, shape.to_shape = MagicMock(), MagicMock()
+        shape.selected = False
+        shape.from_shape, shape.to_shape = None, None
         
         self.canvas.draw_shape(shape)
         self.assertTrue(self.mock_create_line.called)
@@ -235,8 +235,8 @@ class CanvasViewTests(unittest.TestCase):
         is correctly applied via canvas line parameters."""
         conn = MagicMock(spec=Connection)
         conn.connection_type = "dashed"
-        conn.arrow_id = None
-        conn.get_endpoints.return_value = ((10, 10), (100, 100))
+        conn.from_shape, conn.to_shape = ComponentBox(10, 50), ComponentBox(100, 60)
+        conn.from_anchor, conn.to_anchor = 'top', 'bottom'
         
         self.canvas.draw_connection(conn)
         self.mock_create_line.assert_called_once_with(
@@ -275,14 +275,14 @@ class CanvasViewTests(unittest.TestCase):
         diagram = MagicMock()
         shape = ComponentBox(0, 0)
         shape.x, shape.y, shape.text = 50, 50, "Box"
-        shape.shape_id, shape.text_id, shape.selected = None, None, False
+        shape.selected = False
         shape.get_bounds = MagicMock(return_value=(0, 0, 10, 10))
         shape.properties = {}
         
         conn = MagicMock(spec=Connection)
-        conn.arrow_id = None
         conn.connection_type = "solid"
-        conn.get_endpoints.return_value = ((0, 0), (10, 10))
+        conn.from_shape, conn.to_shape = ComponentBox(0, 40), ComponentBox(10, -30)
+        conn.from_anchor, conn.to_anchor = 'top', 'bottom'
         
         diagram.shapes = [shape]
         diagram.connections = [conn]
@@ -299,7 +299,7 @@ class CanvasViewTests(unittest.TestCase):
         """Checks that moving items uses the canvas translate command 
         on specific object IDs rather than a full redraw."""
         shape = ComponentBox(0, 0)
-        shape.shape_id, shape.text_id = 101, 202
+        self.canvas._canvas_items[shape] = {'body': 101, 'text': 202}
         self.canvas.move = MagicMock()
         
         self.canvas.move_items(shape, 15.0, -10.0)
@@ -314,9 +314,11 @@ class CanvasViewTests(unittest.TestCase):
         shape_b = MagicMock()
         
         conn_1 = MagicMock(spec=Connection)
-        conn_1.from_shape, conn_1.to_shape, conn_1.arrow_id = shape_a, shape_b, None
+        conn_1.from_shape, conn_1.to_shape = shape_a, shape_b
         conn_1.connection_type = "solid"
-        conn_1.get_endpoints.return_value = ((0, 0), (10, 10))
+        conn_1.from_anchor, conn_1.to_anchor = 'top', 'bottom'
+        shape_a.get_connection_points.return_value = {'top': (0, 0)}
+        shape_b.get_connection_points.return_value = {'bottom': (10, 10)}
         
         conn_2 = MagicMock(spec=Connection)
         conn_2.from_shape, conn_2.to_shape = MagicMock(), MagicMock()

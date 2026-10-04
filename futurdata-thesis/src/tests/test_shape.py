@@ -67,8 +67,8 @@ class ShapeBaseTests(unittest.TestCase):
         self.assertEqual(s.x, 5)
         self.assertEqual(s.y, 7)
         self.assertEqual(s.shape_type, "action")
-        self.assertIsNone(s.shape_id)
-        self.assertIsNone(s.text_id)
+        self.assertFalse(hasattr(s, 'shape_id'))
+        self.assertFalse(hasattr(s, 'text_id'))
         self.assertFalse(s.selected)
 
     def test_reset_counter_restarts_id_sequence(self):

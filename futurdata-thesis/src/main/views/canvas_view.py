@@ -1,3 +1,4 @@
+from copy import copy
 import tkinter as tk
 from tkinter import font as tkfont
 from ..utils.text_layout import wrap_measured
@@ -41,12 +42,17 @@ class DiagramCanvas(tk.Canvas):
         self.zoom_factor = 1.0
         self.canvas_width = self.MIN_CANVAS_WIDTH
         self.canvas_height = self.MIN_CANVAS_HEIGHT
-        self.config(scrollregion=(0, 0, self.canvas_width * self.zoom_factor, self.canvas_height * self.zoom_factor))
+        self._scroll_origin = (0, 0)
+        self.config(scrollregion=(self._scroll_origin[0] * self.zoom_factor, self._scroll_origin[1] * self.zoom_factor, self.canvas_width * self.zoom_factor, self.canvas_height * self.zoom_factor))
         self.show_grid = True
         self.snap_to_grid = True
         self.alignment_guides = {'vertical': [], 'horizontal': []}
         self.color_resolver = None
         self._component_images = {}
+        self._render_shapes = {}
+        self._canvas_items = {}
+        self._connection_items = {}
+        self._preview_line_id = None
         self.draw_grid()
         self.diagram = None
 
@@ -65,7 +71,7 @@ class DiagramCanvas(tk.Canvas):
             expanded = True
 
         if expanded:
-            self.config(scrollregion=(0, 0, self.canvas_width * self.zoom_factor, self.canvas_height * self.zoom_factor))
+            self.config(scrollregion=(self._scroll_origin[0] * self.zoom_factor, self._scroll_origin[1] * self.zoom_factor, self.canvas_width * self.zoom_factor, self.canvas_height * self.zoom_factor))
             if redraw_grid:
                 self.draw_grid()
 
@@ -110,8 +116,8 @@ class DiagramCanvas(tk.Canvas):
             return
         
         # Get shape position
-        shape_x = shape.x
-        shape_y = shape.y
+        shape_x = self.render_shape(shape).x
+        shape_y = self.render_shape(shape).y
         
         # Get visible area
         visible_width = self.winfo_width() / self.zoom_factor
@@ -127,10 +133,12 @@ class DiagramCanvas(tk.Canvas):
         y_view = self.yview()
         
         # Current visible area in canvas coordinates
-        visible_x1 = x_view[0] * self.canvas_width
-        visible_x2 = x_view[1] * self.canvas_width
-        visible_y1 = y_view[0] * self.canvas_height
-        visible_y2 = y_view[1] * self.canvas_height
+        origin_x, origin_y = self._scroll_origin
+        region_width, region_height = self.canvas_width - origin_x, self.canvas_height - origin_y
+        visible_x1 = origin_x + x_view[0] * region_width
+        visible_x2 = origin_x + x_view[1] * region_width
+        visible_y1 = origin_y + y_view[0] * region_height
+        visible_y2 = origin_y + y_view[1] * region_height
         
         # Check if shape is already fully visible with some margin
         margin = 100
@@ -144,12 +152,12 @@ class DiagramCanvas(tk.Canvas):
         target_y = shape_y - (visible_height / 2)
         
         # Clamp to valid range
-        target_x = max(0, min(target_x, self.canvas_width - visible_width))
-        target_y = max(0, min(target_y, self.canvas_height - visible_height))
+        target_x = max(origin_x, min(target_x, self.canvas_width - visible_width))
+        target_y = max(origin_y, min(target_y, self.canvas_height - visible_height))
         
         # Convert to fractions
-        x_fraction = target_x / self.canvas_width if self.canvas_width > 0 else 0
-        y_fraction = target_y / self.canvas_height if self.canvas_height > 0 else 0
+        x_fraction = (target_x - origin_x) / region_width if region_width > 0 else 0
+        y_fraction = (target_y - origin_y) / region_height if region_height > 0 else 0
         
         # Scroll to position
         self.xview_moveto(x_fraction)
@@ -158,13 +166,16 @@ class DiagramCanvas(tk.Canvas):
     def center_on_shape(self, shape):
         """Center a model bounding box using the current viewport transform."""
         self.update_idletasks()
-        left, top, right, bottom = shape.get_bounds()
+        left, top, right, bottom = self.render_bounds(shape)
         zoom = self.zoom_factor
         x0, y0, x1, y1 = map(float, self.tk.splitlist(self.cget('scrollregion')))
         # Include out-of-region imported geometry without moving model nodes.
         region = (min(x0, left * zoom - 40), min(y0, top * zoom - 40),
                   max(x1, right * zoom + 40), max(y1, bottom * zoom + 40))
         self.configure(scrollregion=region)
+        self._scroll_origin = (region[0] / zoom, region[1] / zoom)
+        self.canvas_width = max(self.canvas_width, region[2] / zoom)
+        self.canvas_height = max(self.canvas_height, region[3] / zoom)
         x0, y0, x1, y1 = region
         inset = float(self.cget('borderwidth')) + float(self.cget('highlightthickness'))
         width = max(1, self.winfo_width() - 2 * inset)
@@ -176,51 +187,120 @@ class DiagramCanvas(tk.Canvas):
         self.xview_moveto((target_x - x0) / max(1, x1 - x0))
         self.yview_moveto((target_y - y0) / max(1, y1 - y0))
 
-    def update_scroll_region_from_shapes(self, shapes) -> None:
-        """Updates scroll region to encompass all shapes with padding."""
-        if not shapes:
-            self.canvas_width = self.MIN_CANVAS_WIDTH
-            self.canvas_height = self.MIN_CANVAS_HEIGHT
-        else:
-            max_x = max(shape.get_bounds()[2] + 40 for shape in shapes)  # Add padding for shape size
-            max_y = max(shape.get_bounds()[3] + 40 for shape in shapes)
-            self.canvas_width = max(self.MIN_CANVAS_WIDTH, int(max_x + self.EXPANSION_MARGIN))
-            self.canvas_height = max(self.MIN_CANVAS_HEIGHT, int(max_y + self.EXPANSION_MARGIN))
-
-        self.config(scrollregion=(0, 0, self.canvas_width * self.zoom_factor, self.canvas_height * self.zoom_factor))
-        self.draw_grid()
+    def update_scroll_region_from_shapes(self, shapes, redraw_grid=True) -> None:
+        """Include rendered extents without translating document geometry."""
+        bounds = [self.render_bounds(shape) for shape in shapes]
+        left = min([0] + [b[0] - 40 for b in bounds])
+        top = min([0] + [b[1] - 40 for b in bounds])
+        self.canvas_width = max(self.MIN_CANVAS_WIDTH, int(max([0] + [b[2] + 40 for b in bounds]) + self.EXPANSION_MARGIN))
+        self.canvas_height = max(self.MIN_CANVAS_HEIGHT, int(max([0] + [b[3] + 40 for b in bounds]) + self.EXPANSION_MARGIN))
+        self._scroll_origin = (left, top)
+        zoom = self.zoom_factor
+        self.config(scrollregion=(left * zoom, top * zoom, self.canvas_width * zoom, self.canvas_height * zoom))
+        if redraw_grid:
+            self.draw_grid()
 
     def draw_grid(self):
         """Renders the grid overlay pattern onto the canvas background using default constants."""
         if not self.show_grid:
             return
-        x1, y1 = 0, 0
+        x1, y1 = self._scroll_origin
         x2, y2 = self.canvas_width, self.canvas_height
         self.delete("grid")
-        for x in range(0, x2 + 1, self.GRID_SIZE):
+        for x in range(int(self._scroll_origin[0] // self.GRID_SIZE) * self.GRID_SIZE, int(x2) + 1, self.GRID_SIZE):
             self.create_line(x, y1, x, y2, fill=self.GRID_COLOR, tags="grid")
-        for y in range(0, y2 + 1, self.GRID_SIZE):
+        for y in range(int(self._scroll_origin[1] // self.GRID_SIZE) * self.GRID_SIZE, int(y2) + 1, self.GRID_SIZE):
             self.create_line(x1, y, x2, y, fill=self.GRID_COLOR, tags="grid")
         self.tag_lower("grid")
+
+    def render_shape(self, shape):
+        """Return canvas-owned geometry; domain objects remain read-only."""
+        rendered = self._render_shapes.get(shape)
+        if rendered is None:
+            return shape
+        rendered.x += shape.x - rendered._logical_x
+        rendered.y += shape.y - rendered._logical_y
+        rendered._logical_x, rendered._logical_y = shape.x, shape.y
+        return rendered
+
+    def render_bounds(self, shape):
+        if isinstance(shape, ArrowShape):
+            (x1, y1), (x2, y2) = self.render_endpoints(shape)
+            return min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)
+        return self.render_shape(shape).get_bounds()
+
+    def render_endpoints(self, edge):
+        if edge.from_shape is None or edge.to_shape is None:
+            return (edge.x, edge.y), (edge.end_x, edge.end_y)
+        start, end = self.render_shape(edge.from_shape), self.render_shape(edge.to_shape)
+        from_anchor, to_anchor = edge.from_anchor, edge.to_anchor
+        if isinstance(edge, ArrowShape):
+            dx, dy = end.x - start.x, end.y - start.y
+            if abs(dx) > abs(dy):
+                from_anchor, to_anchor = ('right', 'left') if dx > 0 else ('left', 'right')
+            else:
+                from_anchor, to_anchor = ('bottom', 'top') if dy > 0 else ('top', 'bottom')
+        return (start.get_connection_points().get(from_anchor, (start.x, start.y)),
+                end.get_connection_points().get(to_anchor, (end.x, end.y)))
+
+    def find_shape_at_point(self, diagram, x, y):
+        """Hit testing uses the same geometry that the user sees."""
+        for shape in reversed(diagram.shapes):
+            if isinstance(shape, ArrowShape):
+                (ax, ay), (bx, by) = self.render_endpoints(shape)
+                length = (bx - ax) ** 2 + (by - ay) ** 2
+                t = max(0, min(1, ((x-ax)*(bx-ax)+(y-ay)*(by-ay))/length)) if length else 0
+                if (x-ax-t*(bx-ax))**2 + (y-ay-t*(by-ay))**2 <= 100:
+                    return shape
+            elif self.render_shape(shape).contains_point(x, y):
+                return shape
+        return None
+
+    def preview_connection_from(self, shape, x=None, y=None):
+        rendered = self.render_shape(shape)
+        self.show_connection_preview(rendered.x, rendered.y,
+                                     rendered.x + 100 if x is None else x,
+                                     rendered.y if y is None else y)
+
+    def show_connection_preview(self, x1, y1, x2, y2):
+        self.clear_connection_preview()
+        self._preview_line_id = self.create_line(
+            x1, y1, x2, y2, fill="black", width=2, dash=(5, 5),
+            arrow=tk.LAST, arrowshape=(12, 15, 6), tags="preview")
+
+    def clear_connection_preview(self):
+        if self._preview_line_id is not None:
+            self.delete(self._preview_line_id)
+            self._preview_line_id = None
 
     def _measure_shape(self, shape):
         if not isinstance(shape, (ComponentBox, ActionCircle, DiamondStep)):
             return False
-        old_bounds = shape.get_bounds()
+        model = shape
+        previous = self._render_shapes.get(model)
+        shape = copy(model)
+        self._render_shapes[model] = shape
+        if previous is not None:
+            # Individual repaint keeps the visual layout offset relative to the model.
+            shape.x += previous.x - getattr(previous, '_logical_x', model.x)
+            shape.y += previous.y - getattr(previous, '_logical_y', model.y)
+        shape._logical_x, shape._logical_y = model.x, model.y
+        old_bounds = model.get_bounds()
         font = tkfont.Font(self, family="Arial", size=8 if isinstance(shape, DiamondStep) else 9)
+        shape._node_image = None
+        image_path = (shape.properties.get('image_path') if isinstance(shape, ComponentBox)
+                      else getattr(shape, 'image_path', None))
+        if image_path:
+            try:
+                with Image.open(get_image_handler().get_full_path(image_path)) as source:
+                    shape._node_image = ImageOps.exif_transpose(source).convert('RGBA')
+            except (OSError, ValueError, Image.DecompressionBombError):
+                pass  # Missing/corrupt images retain normal node rendering.
         if isinstance(shape, ComponentBox):
             width = shape.WIDTH - 16
             lines = wrap_measured(shape.text, width, font.measure)
             shape.HEIGHT = max(ComponentBox.HEIGHT, len(lines) * font.metrics('linespace') + 16)
             text_height = shape.HEIGHT - 16
-            shape._node_image = None
-            image_path = shape.properties.get('image_path')
-            if image_path:
-                try:
-                    with Image.open(get_image_handler().get_full_path(image_path)) as source:
-                        shape._node_image = ImageOps.exif_transpose(source).convert('RGBA')
-                except (OSError, ValueError, Image.DecompressionBombError):
-                    pass  # Unavailable images retain the readable color-only node.
             if shape._node_image is not None:
                 text_height = len(lines) * font.metrics('linespace')
                 shape.HEIGHT = ComponentBox.HEIGHT + text_height + 16
@@ -231,7 +311,7 @@ class DiagramCanvas(tk.Canvas):
             while True:
                 width = size * ratio - 8
                 lines = wrap_measured(shape.text, width, font.measure)
-                if len(lines) * font.metrics('linespace') + 8 <= size * ratio:
+                if len(lines) * font.metrics('linespace') + 8 + (60 if shape._node_image is not None else 0) <= size * ratio:
                     break
                 size += 10
             text_height = size * ratio - 8
@@ -245,9 +325,12 @@ class DiagramCanvas(tk.Canvas):
         return shape.get_bounds() != old_bounds
 
     def _layout_shapes(self, diagram):
-        shapes = [s for s in diagram.shapes if not isinstance(s, ArrowShape)]
-        changed = [self._measure_shape(s) for s in shapes]
+        self._render_shapes.clear()
+        models = [s for s in diagram.shapes if not isinstance(s, ArrowShape)]
+        changed = [self._measure_shape(s) for s in models]
+        shapes = [self._render_shapes[s] for s in models]
         if not any(changed):
+            self.update_scroll_region_from_shapes(models, redraw_grid=False)
             return
         # Keep expanded shapes reachable in the canvas's positive scroll region.
         dx = max(0, 20 - min(s.get_bounds()[0] for s in shapes))
@@ -262,9 +345,9 @@ class DiagramCanvas(tk.Canvas):
                 if left < pr + 16 and right > pl - 16 and top < pb + 20:
                     shape.y += pb + 20 - top
             placed.append(shape)
-        self.update_scroll_region_from_shapes(shapes)
+        self.update_scroll_region_from_shapes(models, redraw_grid=False)
 
-    def draw_shape(self, shape: Shape) -> None:
+    def draw_shape(self, shape: Shape, measure=True) -> None:
         """
         Clears existing instances of a shape model from the canvas and triggers 
         the appropriate specialized drawing routine based on its class type.
@@ -272,14 +355,15 @@ class DiagramCanvas(tk.Canvas):
         Args:
             shape (Shape): The concrete instance model element requiring drawing.
         """
-        self._measure_shape(shape)
+        if measure:
+            self._measure_shape(shape)
         previous_image = self._component_images.pop(shape, None)
         if previous_image is not None:
             self.delete(previous_image[0])
-        if shape.shape_id is not None:
-            self.delete(shape.shape_id)
-        if shape.text_id is not None:
-            self.delete(shape.text_id)
+        if self._canvas_items.setdefault(shape, {}).get('body') is not None:
+            self.delete(self._canvas_items.setdefault(shape, {}).get('body'))
+        if self._canvas_items.setdefault(shape, {}).get('text') is not None:
+            self.delete(self._canvas_items.setdefault(shape, {}).get('text'))
 
         if isinstance(shape, ActionCircle):
             self._draw_action_circle(shape)
@@ -290,8 +374,6 @@ class DiagramCanvas(tk.Canvas):
         elif isinstance(shape, ArrowShape):
             self._draw_arrow_shape(shape)
 
-        if shape.selected:
-            self._draw_selection(shape)
 
     def _draw_action_circle(self, shape: ActionCircle):
         """
@@ -300,14 +382,15 @@ class DiagramCanvas(tk.Canvas):
         Args:
             shape (ActionCircle): The target action model entity.
         """
-        x1, y1, x2, y2 = shape.get_bounds()
+        x1, y1, x2, y2 = self.render_bounds(shape)
         border_width = 3 if shape.selected else 2
         border_color = self.SELECT_COLOR if shape.selected else self.BORDER_COLOR
-        shape.shape_id = self.create_oval(
+        self._canvas_items.setdefault(shape, {})['body'] = self.create_oval(
             x1, y1, x2, y2, fill=self.ACTION_FILL, outline=border_color, width=border_width, tags="shape"
         )
-        shape.text_id = self.create_text(
-            shape.x, shape.y, text=shape._display_text, font=("Arial", 9), fill="black",
+        label_y = self._draw_inscribed_image(shape)
+        self._canvas_items.setdefault(shape, {})['text'] = self.create_text(
+            self.render_shape(shape).x, label_y, text=self.render_shape(shape)._display_text, font=("Arial", 9), fill="black",
             width=0, tags="shape_text"
         )
 
@@ -318,20 +401,21 @@ class DiagramCanvas(tk.Canvas):
         Args:
             shape (DiamondStep): The target action element.
         """
-        half = shape.SIZE / 2
+        half = self.render_shape(shape).SIZE / 2
         points = [
-            shape.x, shape.y - half,
-            shape.x + half, shape.y,
-            shape.x, shape.y + half,
-            shape.x - half, shape.y
+            self.render_shape(shape).x, self.render_shape(shape).y - half,
+            self.render_shape(shape).x + half, self.render_shape(shape).y,
+            self.render_shape(shape).x, self.render_shape(shape).y + half,
+            self.render_shape(shape).x - half, self.render_shape(shape).y
         ]
         border_width = 3 if shape.selected else 2
         border_color = self.SELECT_COLOR if shape.selected else self.BORDER_COLOR
-        shape.shape_id = self.create_polygon(
+        self._canvas_items.setdefault(shape, {})['body'] = self.create_polygon(
             points, fill=self.DIAMOND_FILL, outline=border_color, width=border_width, tags="shape"
         )
-        shape.text_id = self.create_text(
-            shape.x, shape.y, text=shape._display_text, font=("Arial", 8), fill="black",
+        label_y = self._draw_inscribed_image(shape)
+        self._canvas_items.setdefault(shape, {})['text'] = self.create_text(
+            self.render_shape(shape).x, label_y, text=self.render_shape(shape)._display_text, font=("Arial", 8), fill="black",
             width=0, tags="shape_text"
         )
 
@@ -342,7 +426,7 @@ class DiagramCanvas(tk.Canvas):
         Args:
             shape (ComponentBox): The target material component element box.
         """
-        x1, y1, x2, y2 = shape.get_bounds()
+        x1, y1, x2, y2 = self.render_bounds(shape)
         border_width = 3 if shape.selected else 2
         border_color = self.SELECT_COLOR if shape.selected else self.BORDER_COLOR
         
@@ -375,12 +459,12 @@ class DiagramCanvas(tk.Canvas):
         except (tk.TclError, TypeError, ValueError):
             fill_color, text_color = self.COMPONENT_FILL, "black"
 
-        source = shape._node_image
-        label_y = shape.y
+        source = self.render_shape(shape)._node_image
+        label_y = self.render_shape(shape).y
         if source is not None:
             fill_color, text_color = "white", "black"
-            label_y = y2 - (shape._text_height + 16) / 2
-        shape.shape_id = self.create_rectangle(
+            label_y = y2 - (self.render_shape(shape)._text_height + 16) / 2
+        self._canvas_items.setdefault(shape, {})['body'] = self.create_rectangle(
             x1, y1, x2, y2, fill=fill_color, outline=border_color, width=border_width, tags="shape"
         )
         if source is not None:
@@ -388,13 +472,30 @@ class DiagramCanvas(tk.Canvas):
             width = x2 - x1 - inset * 2
             height = ComponentBox.HEIGHT - inset
             photo = self._component_photo(source, width, height)
-            item = self.create_image(shape.x, y1 + inset + height / 2,
+            item = self.create_image(self.render_shape(shape).x, y1 + inset + height / 2,
                                      image=photo, tags="shape")
             self._component_images[shape] = (item, source, width, height, photo)
-        shape.text_id = self.create_text(
-            shape.x, label_y, text=shape._display_text, font=("Arial", 9), fill=text_color,
+        self._canvas_items.setdefault(shape, {})['text'] = self.create_text(
+            self.render_shape(shape).x, label_y, text=self.render_shape(shape)._display_text, font=("Arial", 9), fill=text_color,
             width=0, tags="shape_text"
         )
+
+    def _draw_inscribed_image(self, shape):
+        """Use the component image lifecycle inside the circle/diamond safe rectangle."""
+        if self.render_shape(shape)._node_image is None:
+            return self.render_shape(shape).y
+        size = self.render_shape(shape).RADIUS * 2 if isinstance(shape, ActionCircle) else self.render_shape(shape).SIZE
+        ratio = 0.65 if isinstance(shape, ActionCircle) else 0.46
+        width = size * ratio - 8
+        text_height = len(self.render_shape(shape)._display_text.splitlines()) * tkfont.Font(
+            self, family="Arial", size=9 if isinstance(shape, ActionCircle) else 8
+        ).metrics('linespace')
+        height = size * ratio - 8 - text_height - 8
+        top = self.render_shape(shape).y - (size * ratio - 8) / 2
+        photo = self._component_photo(self.render_shape(shape)._node_image, width, height)
+        item = self.create_image(self.render_shape(shape).x, top + height / 2, image=photo, tags="shape")
+        self._component_images[shape] = (item, self.render_shape(shape)._node_image, width, height, photo)
+        return top + height + 8 + text_height / 2
 
     def _component_photo(self, source, width, height):
         """Fit the whole image proportionally on an opaque, neutral background."""
@@ -413,20 +514,14 @@ class DiagramCanvas(tk.Canvas):
         Args:
             shape (ArrowShape): The vector arrow shape structure to render.
         """
-        if shape.from_shape and shape.to_shape:
-            shape.update_from_shapes()
-        end_x = shape.end_x
-        end_y = shape.end_y
+        (start_x, start_y), (end_x, end_y) = self.render_endpoints(shape)
         border_width = 3 if shape.selected else 2
         border_color = self.SELECT_COLOR if shape.selected else self.BORDER_COLOR
-        shape.shape_id = self.create_line(
-            shape.x, shape.y, end_x, end_y, fill=border_color, width=border_width,
+        self._canvas_items.setdefault(shape, {})['body'] = self.create_line(
+            start_x, start_y, end_x, end_y, fill=border_color, width=border_width,
             arrow=tk.LAST, arrowshape=(12, 15, 6), tags="shape"
         )
-        shape.text_id = None
-
-    def _draw_selection(self, shape: Shape):
-        pass
+        self._canvas_items.setdefault(shape, {})['text'] = None
 
     def draw_connection(self, connection: Connection) -> None:
         """
@@ -435,11 +530,11 @@ class DiagramCanvas(tk.Canvas):
         Args:
             connection (Connection): The connection model entity configuration.
         """
-        if connection.arrow_id is not None:
-            self.delete(connection.arrow_id)
-        (x1, y1), (x2, y2) = connection.get_endpoints()
+        if self._connection_items.get(connection) is not None:
+            self.delete(self._connection_items.get(connection))
+        (x1, y1), (x2, y2) = self.render_endpoints(connection)
         dash = (5, 5) if connection.connection_type == "dashed" else None
-        connection.arrow_id = self.create_line(
+        self._connection_items[connection] = self.create_line(
             x1, y1, x2, y2, fill=self.BORDER_COLOR, width=2,
             arrow=tk.LAST, arrowshape=(10, 12, 5), dash=dash, tags="connection"
         )
@@ -465,6 +560,9 @@ class DiagramCanvas(tk.Canvas):
     def clear_canvas(self):
         """Removes core visual entities including shapes, text strings, linkages, and alignment markers."""
         self._component_images.clear()
+        self._canvas_items.clear()
+        self._connection_items.clear()
+        self._render_shapes.clear()
         self.delete("shape")
         self.delete("shape_text")
         self.delete("connection")
@@ -491,12 +589,15 @@ class DiagramCanvas(tk.Canvas):
 
         # Clear existing elements and reset background grid
         self._component_images.clear()
+        self._canvas_items.clear()
+        self._connection_items.clear()
+        self._preview_line_id = None
         self.delete("all")
         self.draw_grid()
         
        # Render diagram elements: shapes first, then connections
         for shape in diagram.shapes:
-            self.draw_shape(shape)
+            self.draw_shape(shape, measure=False)
         for conn in diagram.connections:
             self.draw_connection(conn)
 
@@ -525,15 +626,20 @@ class DiagramCanvas(tk.Canvas):
 
     def move_items(self, shape: Shape, dx: float, dy: float):
         """Move shape's canvas items by dx, dy - much faster than redrawing."""
+        rendered = self._render_shapes.get(shape)
+        if rendered is not None:
+            rendered.x += dx
+            rendered.y += dy
+            rendered._logical_x, rendered._logical_y = shape.x, shape.y
         image = self._component_images.get(shape)
         if image is not None:
             self.move(image[0], dx * self.zoom_factor, dy * self.zoom_factor)
         dx *= self.zoom_factor
         dy *= self.zoom_factor
-        if shape.shape_id is not None:
-            self.move(shape.shape_id, dx, dy)
-        if shape.text_id is not None:
-            self.move(shape.text_id, dx, dy)
+        if self._canvas_items.setdefault(shape, {}).get('body') is not None:
+            self.move(self._canvas_items.setdefault(shape, {}).get('body'), dx, dy)
+        if self._canvas_items.setdefault(shape, {}).get('text') is not None:
+            self.move(self._canvas_items.setdefault(shape, {}).get('text'), dx, dy)
 
     def update_connections_for_shapes(self, shapes: List[Shape], diagram):
         """Update only connections attached to the given shapes."""
@@ -577,21 +683,21 @@ class DiagramCanvas(tk.Canvas):
         if self.diagram is None:
             return
         for shape in self.diagram.shapes:
-            if not isinstance(shape, (ComponentBox, ActionCircle, DiamondStep)) or shape.text_id is None:
+            if not isinstance(shape, (ComponentBox, ActionCircle, DiamondStep)) or self._canvas_items.setdefault(shape, {}).get('text') is None:
                 continue
             points = 8 if isinstance(shape, DiamondStep) else 9
             pixels = max(1, int(self.winfo_fpixels(f"{points}p") * self.zoom_factor))
             font = tkfont.Font(self, family="Arial", size=-pixels)
-            lines = shape._display_text.split("\n")
+            lines = self.render_shape(shape)._display_text.split("\n")
             # Font hinting and integer line spacing do not scale linearly.
             # Check native metrics rather than assuming point-size arithmetic.
             while pixels > 1:
-                if (max(font.measure(line) for line in lines) <= shape._text_width * self.zoom_factor
-                        and font.metrics('linespace') * len(lines) <= shape._text_height * self.zoom_factor):
+                if (max(font.measure(line) for line in lines) <= self.render_shape(shape)._text_width * self.zoom_factor
+                        and font.metrics('linespace') * len(lines) <= self.render_shape(shape)._text_height * self.zoom_factor):
                     break
                 pixels -= 1
                 font.configure(size=-pixels)
-            self.itemconfigure(shape.text_id, font=("Arial", -pixels), width=0)
+            self.itemconfigure(self._canvas_items.setdefault(shape, {}).get('text'), font=("Arial", -pixels), width=0)
 
     def model_x(self, x):
         return self.canvasx(x) / self.zoom_factor
@@ -642,7 +748,8 @@ class DiagramCanvas(tk.Canvas):
             self._component_images[shape] = (item, source, image_width, image_height, photo)
         self._scale_labels()
         width, height = self.canvas_width * next_zoom, self.canvas_height * next_zoom
-        self.config(scrollregion=(0, 0, width, height))
-        self.xview_moveto((anchor_x * factor - x) / width)
-        self.yview_moveto((anchor_y * factor - y) / height)
+        left, top = (value * next_zoom for value in self._scroll_origin)
+        self.config(scrollregion=(left, top, width, height))
+        self.xview_moveto((anchor_x * factor - x - left) / max(1, width - left))
+        self.yview_moveto((anchor_y * factor - y - top) / max(1, height - top))
         self.draw_grid()

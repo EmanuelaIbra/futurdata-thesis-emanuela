@@ -1,3 +1,4 @@
+from copy import deepcopy
 from typing import List
 
 
@@ -190,7 +191,7 @@ class RemoveShapeCommand(Command):
 class MoveShapeCommand(Command):
     """Encapsulates translation operations across single or multiple diagram items."""
 
-    def __init__(self, shapes, dx, dy):
+    def __init__(self, shapes, dx, dy, diagram=None):
         """
         Standardizes single instances into lists and caches directional coordinate offsets.
 
@@ -200,6 +201,7 @@ class MoveShapeCommand(Command):
             dy (float or int): Vertical delta coordinate translation offset.
         """
         self.shapes = shapes if isinstance(shapes, list) else [shapes]
+        self.diagram = diagram
         self.dx = dx
         self.dy = dy
 
@@ -207,11 +209,15 @@ class MoveShapeCommand(Command):
         """Applies positive coordinate translations to all tracked canvas entities."""
         for shape in self.shapes:
             shape.move(self.dx, self.dy)
+        if self.diagram is not None:
+            self.diagram.modified = True
 
     def undo(self):
         """Applies inverse coordinate offsets to snap entities back to their origins."""
         for shape in self.shapes:
             shape.move(-self.dx, -self.dy)
+        if self.diagram is not None:
+            self.diagram.modified = True
 
     def get_description(self) -> str:
         """
@@ -292,7 +298,7 @@ class RemoveConnectionCommand(Command):
 class EditShapePropertiesCommand(Command):
     """Manages attributes mutations, supporting reversible changes on properties schemas."""
 
-    def __init__(self, shape, old_properties, new_properties):
+    def __init__(self, shape, old_properties, new_properties, diagram=None):
         """
         Caches snapshot data structures representing properties before and after changes.
 
@@ -302,8 +308,13 @@ class EditShapePropertiesCommand(Command):
             new_properties (Dict[str, Any]): A dictionary mapping the new configuration variables.
         """
         self.shape = shape
-        self.old_properties = old_properties
-        self.new_properties = new_properties
+        self.diagram = diagram
+        self.old_properties = deepcopy(old_properties)
+        self.new_properties = deepcopy(new_properties)
+        self._missing_properties = {
+            key for key in new_properties
+            if hasattr(shape, "properties") and key not in shape.properties and not hasattr(shape, key)
+        }
 
     def execute(self):
         """Applies new property updates directly to the destination shape."""
@@ -312,6 +323,8 @@ class EditShapePropertiesCommand(Command):
     def undo(self):
         """Re-injects initial property values to restore original shape attributes."""
         self._apply_properties(self.old_properties)
+        for key in self._missing_properties:
+            self.shape.properties.pop(key, None)
 
     def _apply_properties(self, properties):
         """
@@ -320,11 +333,13 @@ class EditShapePropertiesCommand(Command):
         Args:
             properties (Dict[str, Any]): The collection dataset containing attributes to append.
         """
+        if self.diagram is not None:
+            self.diagram.modified = True
         for key, value in properties.items():
-            if hasattr(self.shape, "properties") and key in getattr(self.shape, "properties", {}):
-                self.shape.properties[key] = value
+            if hasattr(self.shape, "properties") and (key in self.shape.properties or not hasattr(self.shape, key)):
+                self.shape.properties[key] = deepcopy(value)
             elif hasattr(self.shape, key):
-                setattr(self.shape, key, value)
+                setattr(self.shape, key, deepcopy(value))
 
     def get_description(self) -> str:
         """

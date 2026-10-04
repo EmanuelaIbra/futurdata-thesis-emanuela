@@ -1,3 +1,4 @@
+from datetime import datetime
 import json
 from pathlib import Path
 
@@ -26,11 +27,13 @@ class DiagramSerializer:
         """
         try:
             data = diagram.to_dict()
+            data["metadata"]["modified"] = datetime.now().isoformat()
             parent_dir = Path(file_path).parent
             if str(parent_dir) and str(parent_dir) != ".":
                 parent_dir.mkdir(parents=True, exist_ok=True)
             with open(file_path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
+            diagram.metadata["modified"] = data["metadata"]["modified"]
             diagram.file_path = file_path
             diagram.modified = False
             return True

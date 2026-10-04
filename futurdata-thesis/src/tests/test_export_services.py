@@ -23,6 +23,7 @@ class UnusedRepository:
 def export_diagram(tmp_path, monkeypatch):
     handler = ImageHandler(str(tmp_path / "store"))
     image = Path(handler.images_dir) / "part.png"
+    image.parent.mkdir(parents=True, exist_ok=True)
     Image.new("RGB", (16, 16), "blue").save(image)
     for module in ("document_export_service", "presentation_service"):
         monkeypatch.setattr(

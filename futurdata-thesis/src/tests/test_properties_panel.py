@@ -64,7 +64,7 @@ class PropertiesPanelTests(unittest.TestCase):
     def test_init_sets_defaults_and_creates_base_widgets(self):
         """Verify the panel configures correctly with its callback and database."""
         self.assertEqual(self.panel.on_apply_callback, self.mock_on_apply)
-        self.assertEqual(self.panel.repository, self.mock_db)
+        self.assertEqual(self.panel.data_provider, self.mock_db)
         self.assertEqual(self.panel.dynamic_fields, {})
 
     def test_load_shape_none_clears_panel_and_hides_widgets(self):
@@ -145,15 +145,15 @@ class PropertiesPanelTests(unittest.TestCase):
         self.assertEqual(str(widget['state']), 'readonly')
         self.assertEqual(widget.get(), "Tool 2")
         widget.set("Tool 1")
-        self.panel._update_shape_properties()
-        self.assertEqual(shape.tools, "Tool 1")
-        self.assertEqual(shape.tool_id, 1)
-        self.panel.load_shape(shape)
-        self.assertEqual(self.panel.dynamic_fields['tool_id'].get(), "Tool 1")
+        proposed = self.panel._collect_proposed_properties()
+        self.assertEqual(proposed["tools"], "Tool 1")
+        self.assertEqual(proposed['tool_id'], 1)
+        self.assertEqual(shape.tool_id, 2)
+        self.assertEqual(widget.get(), "Tool 1")
         self.panel.dynamic_fields['tool_id'].set('')
-        self.panel._update_shape_properties()
-        self.assertIsNone(shape.tool_id)
-        self.assertEqual(shape.tools, '')
+        proposed = self.panel._collect_proposed_properties()
+        self.assertIsNone(proposed['tool_id'])
+        self.assertEqual(proposed['tools'], '')
 
     def test_on_apply_extracts_and_updates_component_box_model(self):
         """Test that data written in the UI saves into the ComponentBox model."""
@@ -173,11 +173,14 @@ class PropertiesPanelTests(unittest.TestCase):
             "description": mock_desc_widget
         }
 
+        before = dict(shape.__dict__)
         self.panel._on_apply()
+        self.assertEqual(shape.__dict__, before)
+        proposed = self.mock_on_apply.call_args.args[2]
 
-        self.assertEqual(shape.properties["name"], "New Block Name")
-        self.assertEqual(shape.properties["description"], "New Desc")
-        self.assertEqual(shape.text, "New Block Name")
+        self.assertEqual(proposed["name"], "New Block Name")
+        self.assertEqual(proposed["description"], "New Desc")
+        self.assertEqual(proposed['text'], "New Block Name")
         
         self.mock_on_apply.assert_called_once()
 
@@ -201,11 +204,14 @@ class PropertiesPanelTests(unittest.TestCase):
             "image_path": mock_img_widget
         }
 
+        before = dict(shape.__dict__)
         self.panel._on_apply()
+        self.assertEqual(shape.__dict__, before)
+        proposed = self.mock_on_apply.call_args.args[2]
 
-        self.assertEqual(shape.text, "Operation Title")
-        self.assertEqual(shape.step_description, "Operation Description")
-        self.assertEqual(shape.image_path, "/assets/icon.png")
+        self.assertEqual(proposed['text'], "Operation Title")
+        self.assertEqual(proposed['step_description'], "Operation Description")
+        self.assertEqual(proposed['image_path'], "/assets/icon.png")
         self.mock_on_apply.assert_called_once()
 
     def test_on_apply_extracts_and_updates_diamond_step_with_combobox_mapping(self):
@@ -231,13 +237,16 @@ class PropertiesPanelTests(unittest.TestCase):
             "tool_id": mock_tool_widget
         }
 
+        before = dict(shape.__dict__)
         self.panel._on_apply()
+        self.assertEqual(shape.__dict__, before)
+        proposed = self.mock_on_apply.call_args.args[2]
 
-        self.assertEqual(shape.name, "System Question")
-        self.assertEqual(shape.text, "System Question")
-        self.assertEqual(shape.description, "Validate token")
-        self.assertEqual(shape.tool_id, 5)
-        self.assertEqual(shape.tools, "Special Tool")
+        self.assertEqual(proposed['name'], "System Question")
+        self.assertEqual(proposed['text'], "System Question")
+        self.assertEqual(proposed['description'], "Validate token")
+        self.assertEqual(proposed['tool_id'], 5)
+        self.assertEqual(proposed['tools'], "Special Tool")
         self.mock_on_apply.assert_called_once()
 
     def test_catalog_refresh_does_not_rebuild_form(self):

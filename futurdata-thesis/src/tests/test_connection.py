@@ -62,7 +62,7 @@ class ConnectionTests(unittest.TestCase):
         self.assertEqual(conn.connection_type, "solid")
         self.assertEqual(conn.from_anchor, "bottom")
         self.assertEqual(conn.to_anchor, "top")
-        self.assertIsNone(conn.arrow_id)
+        self.assertFalse(hasattr(conn, 'arrow_id'))
 
     def test_init_accepts_custom_type_and_anchors(self):
         """Verify custom connection_type and anchor overrides are stored."""

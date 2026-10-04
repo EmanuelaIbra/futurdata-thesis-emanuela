@@ -1,3 +1,4 @@
+from .selector_wheel import create_combobox
 from .dialog_layout import center_on_workspace
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -121,7 +122,7 @@ class AddMaterialDialog(tk.Toplevel):
         category_frame = ttk.Frame(frame)
         category_frame.grid(row=row, column=1, sticky="ew", pady=4)
         category_frame.columnconfigure(0, weight=1)
-        self.category_combo = ttk.Combobox(category_frame, textvariable=self.category_var, state="readonly", style=self.combo_style_name)
+        self.category_combo = create_combobox(category_frame, textvariable=self.category_var, state="readonly", style=self.combo_style_name)
         self.category_combo.grid(row=0, column=0, sticky="ew")
         ttk.Button(category_frame, text="+", width=3, command=self._add_category).grid(row=0, column=1, padx=(6, 0))
 
@@ -131,7 +132,7 @@ class AddMaterialDialog(tk.Toplevel):
         self.subcategory_frame = ttk.Frame(frame)
         self.subcategory_frame.grid(row=row, column=1, sticky="ew", pady=4)
         self.subcategory_frame.columnconfigure(0, weight=1)
-        self.subcategory_combo = ttk.Combobox(self.subcategory_frame, textvariable=self.subcategory_var, state="readonly", style=self.combo_style_name)
+        self.subcategory_combo = create_combobox(self.subcategory_frame, textvariable=self.subcategory_var, state="readonly", style=self.combo_style_name)
         self.subcategory_combo.grid(row=0, column=0, sticky="ew")
         ttk.Button(self.subcategory_frame, text="+", width=3, command=self._add_subcategory).grid(row=0, column=1, padx=(6, 0))
 
@@ -141,7 +142,7 @@ class AddMaterialDialog(tk.Toplevel):
         self.type_frame = ttk.Frame(frame)
         self.type_frame.grid(row=row, column=1, sticky="ew", pady=4)
         self.type_frame.columnconfigure(0, weight=1)
-        self.type_combo = ttk.Combobox(self.type_frame, textvariable=self.type_var, state="readonly", style=self.combo_style_name)
+        self.type_combo = create_combobox(self.type_frame, textvariable=self.type_var, state="readonly", style=self.combo_style_name)
         self.type_combo.grid(row=0, column=0, sticky="ew")
         ttk.Button(self.type_frame, text="+", width=3, command=self._add_type).grid(row=0, column=1, padx=(6, 0))
 

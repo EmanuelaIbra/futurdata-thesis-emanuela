@@ -78,7 +78,6 @@ class ManageMaterialsDialog(tk.Toplevel):
             try:
                 self.controller.delete_material(material_id)
                 self.load_materials()
-                messagebox.showinfo("Success", "Material deleted successfully.", parent=self)
             except ValueError as e:
                 messagebox.showerror("Constraint Error", str(e), parent=self)
             except Exception as e:

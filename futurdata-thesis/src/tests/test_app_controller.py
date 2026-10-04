@@ -1,3 +1,4 @@
+from src.main.utils.feedback import FeedbackType
 """
 Unit tests for AppController delete and clear behaviours.
 
@@ -33,6 +34,7 @@ def make_controller():
         mock_get_db.return_value = MagicMock()
         controller = AppController()
     controller.view = MagicMock()
+    controller.view.ask_confirmation.side_effect = lambda *args: __import__('tkinter').messagebox.askyesno(*args)
     return controller
 
 
@@ -120,17 +122,17 @@ class DeleteShapeTests(unittest.TestCase):
         self.assertEqual(self.diagram.shapes, [comp_c])
         self.assertEqual(self.diagram.connections, [])
 
-    def test_delete_component_with_db_id_deletes_db_row(self):
+    def test_delete_component_defers_storage_until_save(self):
         shape = self._add_component()
         shape.properties["db_id"] = 42
 
         self.diagram.select_shape(shape)
         self.controller.delete_selected()
 
-        self.controller.repository.delete_component.assert_called_once_with(42)
+        self.controller.repository.delete_component.assert_not_called()
         self.assertNotIn(shape, self.diagram.shapes)
 
-    def test_delete_step_with_db_id_deletes_db_step(self):
+    def test_delete_step_defers_storage_until_save(self):
         step = ActionCircle(100, 100)
         step.db_step_id = 7
         self.diagram.add_shape(step)
@@ -138,11 +140,11 @@ class DeleteShapeTests(unittest.TestCase):
         self.diagram.select_shape(step)
         self.controller.delete_selected()
 
-        self.controller.repository.delete_step.assert_called_once_with(7)
+        self.controller.repository.delete_step.assert_not_called()
         self.assertNotIn(step, self.diagram.shapes)
 
-    def test_delete_aborts_when_db_rejects_delete(self):
-        # If the DB refuses (integrity error), the shape must stay on canvas.
+    def test_unsaved_delete_never_contacts_storage(self):
+        # Project edits must remain in memory even when storage would reject a direct deletion.
         shape = self._add_component()
         shape.properties["db_id"] = 42
         self.controller.repository.delete_component.side_effect = DuplicateValueError
@@ -150,10 +152,9 @@ class DeleteShapeTests(unittest.TestCase):
         self.diagram.select_shape(shape)
         self.controller.delete_selected()
 
-        self.assertIn(shape, self.diagram.shapes)
-        self.controller.view.set_status.assert_called_with(
-            "Cannot delete in storage due to existing references."
-        )
+        self.assertNotIn(shape, self.diagram.shapes)
+        self.controller.repository.delete_component.assert_not_called()
+        self.assertTrue(self.diagram.modified)
 
     def test_undo_after_delete_restores_shape_and_connections(self):
         comp_a = self._add_component(100, 100)
@@ -234,7 +235,7 @@ class ClearCanvasTests(unittest.TestCase):
         self.assertEqual(self.diagram.shapes, [])
         self.assertEqual(self.diagram.connections, [])
         self.assertFalse(self.controller.can_undo())
-        self.controller.view.set_status.assert_called_with("Canvas cleared")
+        self.controller.view.set_status.assert_called_with("Canvas cleared", FeedbackType.SUCCESS)
 
     def test_clear_canvas_cancelled_keeps_shapes_and_history(self):
         shape = ComponentBox(100, 100)
@@ -550,71 +551,16 @@ class RepositorySyncTests(unittest.TestCase):
         self.assertEqual(second, 21)
         self.db.create_action.assert_called_once()
 
-    def test_component_to_circle_creates_step(self):
-        root = self._add_root()
-        circle = ActionCircle(300, 100)
-        self.diagram.add_shape(circle)
+    def test_connection_edit_does_not_persist_unsaved_diagram(self):
+        source, target = self._add_root(), DiamondStep(300, 100)
+        self.diagram.add_shape(target)
+        self.db.reset_mock()
+        self.controller._create_connection(source, target)
+        self.assertEqual(len(self.diagram.connections), 1)
+        self.assertEqual(self.db.mock_calls, [])
+        self.controller.undo()
+        self.assertEqual(self.diagram.connections, [])
 
-        self.controller._sync_connection(root, circle)
-
-        self.assertEqual(circle.db_step_id, 11)
-        self.db.create_step.assert_called_once()
-        self.assertEqual(self.db.create_step.call_args.kwargs["component_id"], 1)
-
-    def test_circle_to_component_registers_step_output(self):
-        self._add_root()
-        circle = ActionCircle(300, 100)
-        circle.db_step_id = 11
-        self.diagram.add_shape(circle)
-        leaf = ComponentBox(500, 100)
-        leaf.properties["node_type"] = "Leaf"
-        leaf.properties["db_id"] = 2_000_001
-        self.diagram.add_shape(leaf)
-
-        self.controller._sync_connection(circle, leaf)
-
-        self.db.add_component_to_step.assert_called_once_with(11, 2_000_001)
-
-    def test_circle_to_diamond_links_action_to_step(self):
-        self._add_root()
-        circle = ActionCircle(300, 100)
-        circle.db_step_id = 11
-        self.diagram.add_shape(circle)
-        diamond = DiamondStep(500, 100)
-        self.diagram.add_shape(diamond)
-
-        self.controller._sync_connection(circle, diamond)
-
-        self.db.add_action_to_step.assert_called_once_with(11, 21)
-        self.assertEqual(diamond.db_step_id, 11)
-        self.assertEqual(diamond.db_action_id, 21)
-        self.assertEqual(diamond.db_step_action_id, 31)
-
-    def test_diamond_to_diamond_requires_linked_first_diamond(self):
-        first = DiamondStep(100, 100)
-        second = DiamondStep(300, 100)
-        self.diagram.add_shape(first)
-        self.diagram.add_shape(second)
-
-        self.controller._sync_connection(first, second)
-
-        # No step could be resolved: surfaced as a status warning, no link made.
-        self.db.add_action_to_step.assert_not_called()
-        status = self.controller.view.set_status.call_args[0][0]
-        self.assertIn("storage sync warning", status)
-
-    def test_diamond_to_diamond_chains_actions_on_same_step(self):
-        self._add_root()
-        first = DiamondStep(100, 100)
-        first.db_step_id = 11
-        second = DiamondStep(300, 100)
-        self.diagram.add_shape(first)
-        self.diagram.add_shape(second)
-
-        self.controller._sync_connection(first, second)
-
-        self.db.add_action_to_step.assert_called_once_with(11, 21)
-        self.assertEqual(second.db_step_id, 11)
 
 
 class ArrowConnectionFlowTests(unittest.TestCase):
@@ -713,7 +659,8 @@ class DiagramLifecycleTests(unittest.TestCase):
         self.controller.current_product_id = 3
         self.controller.repository.get_product.return_value = {"name": "Washing Machine"}
 
-        self.assertTrue(self.controller.save_diagram())
+        with patch.object(self.controller, "_persist_diagram"):
+            self.assertTrue(self.controller.save_diagram())
 
         status = self.controller.view.set_status.call_args[0][0]
         self.assertIn("Washing Machine", status)

@@ -72,7 +72,7 @@ class TestManageMaterialsDialog(unittest.TestCase):
         self.dialog.on_delete()
 
         self.mock_controller.delete_material.assert_called_once_with(1)
-        mock_info.assert_called_once_with("Success", "Material deleted successfully.", parent=self.dialog)
+        mock_info.assert_not_called()
 
 
 if __name__ == "__main__":

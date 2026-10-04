@@ -192,10 +192,12 @@ def test_center_clamps_at_edges_and_supports_negative_coordinates(app):
     node = nodes[0]
     for x, y in [(0, 0), (-500, -500), (5000, 5000)]:
         node.x, node.y = x, y
+        canvas.redraw_all(controller.diagram)
         canvas.center_on_shape(node)
         assert (node.x, node.y) == (x, y)
-        assert canvas.canvasx(0) <= x * canvas.zoom_factor <= canvas.canvasx(canvas.winfo_width())
-        assert canvas.canvasy(0) <= y * canvas.zoom_factor <= canvas.canvasy(canvas.winfo_height())
+        rendered = canvas.render_shape(node)
+        assert canvas.canvasx(0) <= rendered.x * canvas.zoom_factor <= canvas.canvasx(canvas.winfo_width())
+        assert canvas.canvasy(0) <= rendered.y * canvas.zoom_factor <= canvas.canvasy(canvas.winfo_height())
 
 
 def test_bundled_projects_project_every_node_and_preserve_data(tmp_path):

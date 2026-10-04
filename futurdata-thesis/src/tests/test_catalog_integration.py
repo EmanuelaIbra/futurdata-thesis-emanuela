@@ -68,9 +68,9 @@ def test_current_future_nodes_and_persistent_catalogs(app):
     controller.add_new_material('Another Material')
     assert material_widget.get() == 'Carbon Fiber'
     assert color_widget.get() == 'Dark Navy'
-    panel._update_shape_properties()
-    assert panel.current_shape.properties['material_id'] == material_id
-    assert panel.current_shape.properties['color_id'] == color_id
+    proposed = panel._collect_proposed_properties()
+    assert proposed['material_id'] == material_id
+    assert proposed['color_id'] == color_id
     panel.load_shape(leaf())
     assert 'Carbon Fiber' in panel.dynamic_fields['material_id']['values']
     assert 'Dark Navy' in panel.dynamic_fields['color_id']['values']
@@ -84,8 +84,10 @@ def test_current_future_nodes_and_persistent_catalogs(app):
     tool_widget.set('Torx T25')
     controller.add_new_tool('Torx T30', 'Driver')
     assert tool_widget.get() == 'Torx T25'
-    panel._update_shape_properties()
-    assert action.tool_id == tool_id
+    proposed = panel._collect_proposed_properties()
+    assert proposed['tool_id'] == tool_id
+    from src.main.utils.commands import EditShapePropertiesCommand
+    EditShapePropertiesCommand(action, {}, proposed).execute()
     root_id = controller.repository.create_product('Test product')
     root_shape = ComponentBox(100, 100)
     root_shape.properties.update(node_type='Root', db_id=root_id)
@@ -297,6 +299,7 @@ def test_blank_leaf_catalogs_save_and_clear_existing_values(app):
     panel.load_shape(shape)
     panel._on_apply()
     controller.view.show_error.assert_not_called()
+    assert controller.save_diagram()
     row = controller.repository.get_component(shape.properties['db_id'])
     assert row['color_id'] is None and row['material_id'] is None
     shape.properties.update(color_id=color, material_id=material)
@@ -307,6 +310,7 @@ def test_blank_leaf_catalogs_save_and_clear_existing_values(app):
     panel._on_material_category_changed(widget)
     panel._on_apply()
     controller.view.show_error.assert_not_called()
+    assert controller.save_diagram()
     row = controller.repository.get_component(shape.properties['db_id'])
     assert row['color_id'] is None and row['material_id'] is None
     assert len(controller.repository.get_all_products()) == 1
@@ -337,7 +341,7 @@ def test_duplicate_root_is_reported_in_window_before_adding(app, operation):
     assert not controller.command_history.can_undo()
 
 
-def test_property_save_error_is_visible_and_does_not_record_edit(app):
+def test_invalid_project_save_is_visible_and_keeps_unsaved_edit(app):
     controller, panel, _ = app
     root = configure_property_saving(controller, panel)
     # A second root from a pre-existing project must also report save failure.
@@ -350,10 +354,12 @@ def test_property_save_error_is_visible_and_does_not_record_edit(app):
     name.delete('1.0', 'end')
     name.insert('1.0', 'Attempted edit')
     panel._on_apply()
+    assert not controller.save_diagram()
     controller.view.show_error.assert_called_once()
     assert 'root' in controller.view.show_error.call_args.args[1].lower()
-    assert second.properties['name'] == 'Original name'
-    assert not controller.command_history.can_undo()
+    assert second.properties['name'] == 'Attempted edit'
+    assert controller.command_history.can_undo()
+    assert controller.diagram.modified
     assert len(controller.repository.get_all_products()) == 1
 
 
@@ -366,6 +372,7 @@ def test_apply_legacy_tool_keeps_new_catalog_id(app):
     panel.load_shape(shape)
     panel._on_apply()
     controller.view.show_error.assert_not_called()
+    assert controller.save_diagram()
     assert shape.tool_id is not None
     assert controller.repository.get_action(shape.db_action_id)['tool_id'] == shape.tool_id
 
@@ -393,7 +400,7 @@ def test_properties_add_new_opens_existing_dialog_selects_result_and_preserves_d
         else:
             key = controller.add_new_tool('New dropdown tool', 'Driver')
         return type('Result', (), {'result': key})()
-    with patch('src.main.controllers.app_controller.' + dialog_class, side_effect=create_dialog) as dialog:
+    with patch('src.main.views.add_' + kind + '_dialog.' + dialog_class, side_effect=create_dialog) as dialog:
         widget.set(widget['values'][-1])
         widget.event_generate('<<ComboboxSelected>>')
         root.update()
@@ -402,7 +409,7 @@ def test_properties_add_new_opens_existing_dialog_selects_result_and_preserves_d
     assert panel._get_widget_value(widget) is not None
     assert name.get('1.0', 'end-1c') == 'Keep my draft'
     chosen = widget.get()
-    with patch('src.main.controllers.app_controller.' + dialog_class) as dialog:
+    with patch('src.main.views.add_' + kind + '_dialog.' + dialog_class) as dialog:
         dialog.return_value.result = None
         widget.set(widget['values'][-1])
         widget.event_generate('<<ComboboxSelected>>')

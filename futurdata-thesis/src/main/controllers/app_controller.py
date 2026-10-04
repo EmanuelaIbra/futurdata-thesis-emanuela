@@ -1,6 +1,5 @@
-import tkinter as tk
-from tkinter import messagebox
-from typing import Optional, Tuple
+from ..utils.feedback import FeedbackType
+from typing import Tuple
 import os
 
 from ..models import Diagram, ActionCircle, DiamondStep, ComponentBox, ArrowShape, Connection
@@ -10,9 +9,6 @@ from ..repositories import get_repository, DuplicateValueError
 from ..services import ProjectArchiveService
 from .catalog_controller import CatalogController
 from .navigator import topology_snapshot, build_outline
-from ..views.add_color_dialog import AddColorDialog
-from ..views.add_material_dialog import AddMaterialDialog
-from ..views.add_tool_dialog import AddToolDialog
 from ..utils import (
     CommandHistory, AddShapeCommand, RemoveShapeCommand, MoveShapeCommand,
     AddConnectionCommand, EditShapePropertiesCommand, MultiCommand, snap_to_grid,
@@ -21,26 +17,28 @@ from ..utils import (
 from ..utils.diagram_loader import DiagramLoader
 from ..utils.json_exporter import EnhancedJSONExporter
 from ..services.document_export_service import DocumentExportService
-from ..views.manage_colors_dialog import ManageColorsDialog
-from ..views.manage_materials_dialog import ManageMaterialsDialog
-from ..views.manage_tools_dialog import ManageToolsDialog
+from ..services.project_persistence import ProjectPersistence
+from ..services.workflow_validation import connection_error
+from ..utils.image_handler import get_image_handler
 
 
 class AppController:
 
-    def __init__(self):
+    def __init__(self, repository=None, catalog=None, diagram_loader=None, json_exporter=None,
+                 archive_service=None, document_export_service=None, persistence_factory=ProjectPersistence, image_handler=None):
         """Initialize controller state, models and helper services."""
         self.diagram = Diagram()
         self.command_history = CommandHistory()
         self.view = None
-        self.repository = get_repository()
-        self.catalog = CatalogController(self.repository)
-        self.diagram_loader = DiagramLoader(self.repository)
-        self.json_exporter = EnhancedJSONExporter(self.repository)
-        self.archive_service = ProjectArchiveService(self.json_exporter)
-        self.document_export_service = DocumentExportService(self.json_exporter)
+        self.repository = repository if repository is not None else get_repository()
+        self.catalog = catalog if catalog is not None else CatalogController(self.repository)
+        self.diagram_loader = diagram_loader if diagram_loader is not None else DiagramLoader(self.repository)
+        self.json_exporter = json_exporter if json_exporter is not None else EnhancedJSONExporter(self.repository)
+        self.archive_service = archive_service if archive_service is not None else ProjectArchiveService(self.json_exporter)
+        self.document_export_service = document_export_service if document_export_service is not None else DocumentExportService(self.json_exporter)
+        self.image_handler = image_handler
+        self.persistence_factory = persistence_factory
         self.current_product_id = None  # Track currently loaded product
-        self.selected_shape = None
         self.dragging = False
         self.drag_start = None
         self.drag_initial_positions = {}
@@ -48,9 +46,7 @@ class AppController:
         self.connect_mode = False
         self.arrow_mode = False
         self.connecting_from = None
-        self.preview_line_id = None
         self.auto_save_timer = None  
-        self.auto_save_delay = 200  
 
     def set_view(self, view):
         """Attach the view and wire up canvas event bindings."""
@@ -100,25 +96,10 @@ class AppController:
             x = self.view.canvas.model_x(event.x)
             y = self.view.canvas.model_y(event.y)
             # Draw preview line from connecting_from shape to mouse cursor
-            self._update_preview_line(self.connecting_from.x, self.connecting_from.y, x, y)
-
-    def _update_preview_line(self, x1, y1, x2, y2):
-        """Draw or update the preview line for arrow/connection."""
-        canvas = self.view.canvas
-        if self.preview_line_id is not None:
-            canvas.delete(self.preview_line_id)
-        self.preview_line_id = canvas.create_line(
-            x1, y1, x2, y2,
-            fill="black", width=2, dash=(5, 5),
-            arrow=tk.LAST, arrowshape=(12, 15, 6),
-            tags="preview"
-        )
+            self.view.canvas.preview_connection_from(self.connecting_from, x, y)
 
     def _clear_preview_line(self):
-        """Remove the preview line."""
-        if self.preview_line_id is not None:
-            self.view.canvas.delete(self.preview_line_id)
-            self.preview_line_id = None
+        self.view.canvas.clear_connection_preview()
 
     def on_escape(self, event):
         """Cancel arrow/connect mode."""
@@ -129,13 +110,12 @@ class AppController:
             self.connecting_from = None
             self.view.canvas.config(cursor="")
             self.view.set_status("Cancelled")
-            self.view.root.after(1500, lambda: self.view.set_status("Ready"))
 
     def on_canvas_click(self, event):
         """Handle left-click: select a shape, start a drag, or start a connection."""
         x = self.view.canvas.model_x(event.x)
         y = self.view.canvas.model_y(event.y)
-        clicked_shape = self.diagram.find_shape_at_point(x, y)
+        clicked_shape = self.view.canvas.find_shape_at_point(self.diagram, x, y)
 
         if self.arrow_mode:
             if clicked_shape:
@@ -204,26 +184,7 @@ class AppController:
             self.view.canvas.draw_alignment_guides(guides)
 
     def _auto_scroll_viewport(self, mouse_x: int, mouse_y: int):
-        """Scroll the canvas when mouse is near the edge of visible area."""
-        canvas = self.view.canvas
-        margin = 50  # Distance from edge to trigger scroll
-
-        visible_width = canvas.winfo_width()
-        visible_height = canvas.winfo_height()
-
-        # Scroll right
-        if mouse_x > visible_width - margin:
-            canvas.xview_scroll(1, "units")
-        # Scroll left
-        elif mouse_x < margin:
-            canvas.xview_scroll(-1, "units")
-
-        # Scroll down
-        if mouse_y > visible_height - margin:
-            canvas.yview_scroll(1, "units")
-        # Scroll up
-        elif mouse_y < margin:
-            canvas.yview_scroll(-1, "units")
+        self.view.canvas.auto_scroll(mouse_x, mouse_y)
 
     def on_canvas_release(self, event):
         """Finish a drag: snap, record the move command and redraw."""
@@ -233,32 +194,32 @@ class AppController:
                 for shape in self.drag_shapes:
                     shape.x, shape.y = snap_to_grid(shape.x, shape.y)
 
-            first_shape = self.drag_shapes[0]
-            initial_pos = self.drag_initial_positions[first_shape]
-            dx = first_shape.x - initial_pos[0]
-            dy = first_shape.y - initial_pos[1]
-
-            if abs(dx) > 1 or abs(dy) > 1:
-                command = MoveShapeCommand(self.drag_shapes, dx, dy)
-                self.command_history.history.append(command)
-                self.command_history.current_index += 1
+            moves = []
+            for shape in self.drag_shapes:
+                initial_x, initial_y = self.drag_initial_positions[shape]
+                dx, dy = shape.x - initial_x, shape.y - initial_y
+                if dx or dy:
+                    moves.append(MoveShapeCommand(shape, dx, dy, self.diagram))
+            if moves:
+                # Dragging previews positions in memory. Restore the starting points
+                # before committing the final translation through normal commands.
+                for shape in self.drag_shapes:
+                    shape.x, shape.y = self.drag_initial_positions[shape]
+                command = moves[0] if len(moves) == 1 else MultiCommand(moves, "Move selected shapes")
+                self.command_history.execute(command)
 
         self.dragging = False
         self.drag_start = None
         self.drag_shapes = []
         self.drag_initial_positions = {}
         self.view.canvas.clear_alignment_guides()
-        # Redraw grid to cover expanded canvas area
-        self.view.canvas.draw_grid()
-        # Full redraw to sync canvas with snapped positions
-        self.view.canvas.redraw_all(self.diagram)
         self._update_view()
 
     def on_canvas_right_click(self, event):
         """Show the context menu for the shape under the cursor."""
         x = self.view.canvas.model_x(event.x)
         y = self.view.canvas.model_y(event.y)
-        clicked_shape = self.diagram.find_shape_at_point(x, y)
+        clicked_shape = self.view.canvas.find_shape_at_point(self.diagram, x, y)
 
         if clicked_shape:
             if self.arrow_mode or self.connect_mode:
@@ -269,13 +230,9 @@ class AppController:
             self._show_context_menu(event, clicked_shape)
 
     def _show_context_menu(self, event, shape):
-        """Build and display the right-click context menu for a shape."""
-        menu = tk.Menu(self.view.root, tearoff=0)
-        menu.add_command(label="Edit Properties", command=lambda: self._edit_shape_properties(shape))
-        menu.add_separator()
-        menu.add_command(label="Duplicate", command=lambda: self._duplicate_shape(shape))
-        menu.add_command(label="Delete", command=lambda: self._delete_shape(shape))
-        menu.post(event.x_root, event.y_root)
+        self.view.show_shape_context_menu(
+            event, lambda: self._edit_shape_properties(shape),
+            lambda: self._duplicate_shape(shape), lambda: self._delete_shape(shape))
 
     def _handle_arrow_connection_click(self, shape):
         """Pick source then target shape to create an arrow in arrow mode."""
@@ -286,321 +243,74 @@ class AppController:
         if self.connecting_from is None:
             self.connecting_from = shape
             # Draw initial preview line from shape center (draw AFTER update_view)
-            self._update_preview_line(shape.x, shape.y, shape.x + 100, shape.y)
-            self.view.set_status(f"Arrow started from {shape.shape_type}. Click target shape or press Delete to remove.")
+            self.view.canvas.preview_connection_from(shape)
+            self.view.set_status(f"Arrow started from {self._shape_display_name(shape)}. Click target shape or press Delete to remove.")
         else:
             self._clear_preview_line()
             if self.connecting_from != shape:
-                self._create_arrow_connection(self.connecting_from, shape)
-                self.view.set_status("Arrow created.")
+                if self._create_arrow_connection(self.connecting_from, shape):
+                    self.view.set_status("Arrow created.", FeedbackType.SUCCESS)
             else:
                 self.view.set_status("Cancelled - same shape.")
             self.connecting_from = None
             self.arrow_mode = False
             self.view.canvas.config(cursor="")
-            self.view.root.after(2000, lambda: self.view.set_status("Ready"))
             self._update_view()
 
     def _handle_connection_click(self, shape):
         """Pick source then target shape to create a connection in connect mode."""
         if self.connecting_from is None:
             self.connecting_from = shape
-            self.view.set_status(f"Connection started from {shape.shape_type}. Click target shape or press ESC to cancel.")
+            self.view.set_status(f"Connection started from {self._shape_display_name(shape)}. Click target shape or press ESC to cancel.")
         else:
             self._clear_preview_line()
             if self.connecting_from != shape:
-                self._create_connection(self.connecting_from, shape)
-                self.view.set_status("Connection created.")
+                if self._create_connection(self.connecting_from, shape):
+                    self.view.set_status("Connection created.", FeedbackType.SUCCESS)
             else:
                 self.view.set_status("Cancelled - same shape.")
             self.connecting_from = None
             self.connect_mode = False
-            self.view.root.after(2000, lambda: self.view.set_status("Ready"))
 
     def _validate_workflow_connection(self, from_shape, to_shape) -> bool:
-        """Reject graph edges that violate the canonical disassembly grammar.
-
-        Canonical structure:
-            Component -> Diamond(operation)
-            Diamond -> Component(result)
-            Diamond -> Action(instruction)
-            Action -> Action(instruction sequence)
-
-        In particular, Component -> Action skips the operation node and
-        Diamond -> Diamond skips the intermediate component/state.
-        """
-        if isinstance(from_shape, ComponentBox) and isinstance(to_shape, ActionCircle):
-            messagebox.showerror(
-                "Invalid workflow connection",
-                "A Component cannot connect directly to a Step.\n\n"
-                "Use:  Component → Diamond (operation) → Step (instruction).\n\n"
-                "The connection was not created.",
-                parent=self.view.root,
-            )
-            self.view.set_status("Invalid connection: Component → Action is not allowed.")
-            return False
-
-        if isinstance(from_shape, DiamondStep) and isinstance(to_shape, DiamondStep):
-            messagebox.showerror(
-                "Invalid workflow connection",
-                "A Diamond cannot connect directly to another Diamond.\n\n"
-                "A diamond operation must first produce a Component/state before "
-                "another operation begins.\n\n"
-                "Use:  Diamond → Component → Diamond.\n\n"
-                "The connection was not created.",
-                parent=self.view.root,
-            )
-            self.view.set_status("Invalid connection: Diamond → Diamond is not allowed.")
-            return False
-
-        return True
+        error = connection_error(from_shape, to_shape)
+        if error is None:
+            return True
+        message, status = error
+        self.view.show_workflow_error("Invalid workflow connection", message)
+        self.view.set_status(status, FeedbackType.ERROR)
+        return False
 
     def _create_arrow_connection(self, from_shape, to_shape):
-        """Create an arrow shape between two shapes and sync it to the storage."""
+        """Create an unsaved arrow after validating the existing graph grammar."""
         if not self._validate_workflow_connection(from_shape, to_shape):
             return False
         arrow = ArrowShape(0, 0, from_shape, to_shape)
         arrow.update_from_shapes()
         command = AddShapeCommand(self.diagram, arrow)
         self.command_history.execute(command)
-        self._sync_connection(from_shape, to_shape)
         self._update_view()
+        return True
 
     def _create_connection(self, from_shape, to_shape):
-        """Create a connection between two shapes and sync it to the storage."""
+        """Create an unsaved connection after validating the existing graph grammar."""
         if not self._validate_workflow_connection(from_shape, to_shape):
             return False
         connection = Connection(from_shape, to_shape)
         connection.auto_calculate_anchors()
         command = AddConnectionCommand(self.diagram, connection)
         self.command_history.execute(command)
-        self._sync_connection(from_shape, to_shape)
         self._update_view()
+        return True
 
-    def _sync_connection(self, from_shape, to_shape, strict=False):
-        """Persist key canvas relationships to storage."""
-        try:
-            # Component -> Circle defines step input.
-            if isinstance(from_shape, ComponentBox) and isinstance(to_shape, ActionCircle):
-                self._ensure_component_id(from_shape)
-                self._ensure_step_id(to_shape, input_shape=from_shape)
-                return
+    def _ensure_component_id(self, shape):
+        return self._storage_operation('_ensure_component_id', shape)
 
-            # Circle -> Component defines step outputs.
-            if isinstance(from_shape, ActionCircle) and isinstance(to_shape, ComponentBox):
-                step_id = self._ensure_step_id(from_shape)
-                component_id = self._ensure_component_id(to_shape)
-                if step_id and component_id:
-                    result = self.repository.add_component_to_step(step_id, component_id)
-                    if result.get("already_linked"):
-                        self.view.set_status("Output already linked to this step.")
-                return
+    def _ensure_step_id(self, shape, input_shape=None):
+        return self._storage_operation('_ensure_step_id', shape, input_shape)
 
-            # Circle -> Diamond defines step-action mapping.
-            if isinstance(from_shape, ActionCircle) and isinstance(to_shape, DiamondStep):
-                step_id = self._ensure_step_id(from_shape)
-                existing_step_id = self._resolve_step_id_for_diamond(to_shape)
-                if existing_step_id is not None and existing_step_id != step_id:
-                    self.view.set_status("Action belongs to another step.")
-                    return
-                action_id = self._ensure_action_id(to_shape)
-                result = self.repository.add_action_to_step(step_id, action_id)
-                to_shape.db_step_id = step_id
-                to_shape.db_action_id = action_id
-                to_shape.db_step_action_id = result["link_id"]
-                to_shape.db_action_order = result["action_order"]
-                if result.get("already_linked"):
-                    self.view.set_status("Action already linked to this step.")
-                return
-
-            # Diamond -> Diamond encodes action sequence for the same step.
-            if isinstance(from_shape, DiamondStep) and isinstance(to_shape, DiamondStep):
-                step_id = self._resolve_step_id_for_diamond(from_shape)
-                if step_id is None:
-                    raise ValueError("Connect circle to first diamond before chaining actions")
-                target_step_id = self._resolve_step_id_for_diamond(to_shape)
-                if target_step_id is not None and target_step_id != step_id:
-                    self.view.set_status("Action belongs to another step.")
-                    return
-
-                action_id = self._ensure_action_id(to_shape)
-                result = self.repository.add_action_to_step(step_id, action_id)
-                to_shape.db_step_id = step_id
-                to_shape.db_action_id = action_id
-                to_shape.db_step_action_id = result["link_id"]
-                to_shape.db_action_order = result["action_order"]
-                if result.get("already_linked"):
-                    self.view.set_status("Action already linked to this step.")
-                return
-        except DuplicateValueError:
-            # Ignore duplicate links constrained by unique indexes.
-            pass
-        except Exception as exc:
-            if strict:
-                raise
-            self.view.set_status(f"storage sync warning: {exc}")
-
-    def _ensure_component_id(self, shape: ComponentBox) -> Optional[int]:
-        """Return the component's storage id, creating the storage row if needed."""
-        db_id = shape.properties.get("db_id")
-        if db_id:
-            row = self.repository.get_component(int(db_id))
-            if isinstance(row, dict) and row.get("diagram_id") != self.diagram.diagram_id:
-                raise ValueError("Component belongs to another diagram")
-            if row:
-                return int(db_id)
-            shape.properties["db_id"] = None
-
-        node_type = str(shape.properties.get("node_type", "Intermediate")).strip() or "Intermediate"
-        node_type = node_type.capitalize()
-
-        name = str(shape.properties.get("name") or shape.text or f"{node_type} Component").strip()
-        color_id = shape.properties.get("color_id") or None
-        material_id = shape.properties.get("material_id") or None
-        weight_val = shape.properties.get("weight")
-        try:
-            weight = float(weight_val) if str(weight_val).strip() else None
-        except (TypeError, ValueError):
-            weight = None
-        weight_unit = shape.properties.get("weight_unit") or "g"
-
-        if node_type == "Root":
-            comp_id = self.repository.create_component(
-                name=name, color_id=color_id, material_id=material_id,
-                weight=weight, weight_unit=weight_unit, node_type="Root",
-                diagram_id=self.diagram.diagram_id,
-            )
-        else:
-            root_component_id = self._get_root_component_id()
-            if root_component_id is None:
-                raise ValueError("Add a Root Component first so Leaf/Composite can link to it")
-            comp_id = self.repository.create_component(
-                name=name,
-                product_id=root_component_id,
-                color_id=color_id,
-                material_id=material_id,
-                weight=weight,
-                weight_unit=weight_unit,
-                node_type=node_type,
-            )
-
-        shape.properties["db_id"] = comp_id
-        if node_type == "Root":
-            self.current_product_id = comp_id
-        return comp_id
-
-    def _find_existing_root_component(self, name: str) -> Optional[dict]:
-        """Find an existing root component by name in JSON storage."""
-        return self.repository.find_root_by_name(name)
-
-    def _get_root_component_id(self) -> Optional[int]:
-        """Return the storage id of the diagram's root component, if any."""
-        for shape in self.diagram.shapes:
-            if isinstance(shape, ComponentBox):
-                node_type = str(shape.properties.get("node_type", "")).strip().lower()
-                if node_type == "root":
-                    return self._ensure_component_id(shape)
-        return None
-
-    def _ensure_step_id(self, step_shape: ActionCircle, input_shape: Optional[ComponentBox] = None) -> Optional[int]:
-        """Return the step's storage id, creating the storage row if needed."""
-        step_id = getattr(step_shape, "db_step_id", None)
-        if input_shape is None:
-            input_shape = self._resolve_input_shape_for_step(step_shape)
-
-        if step_id:
-            row = self.repository.get_step(int(step_id))
-            if isinstance(row, dict) and row.get("diagram_id") != self.diagram.diagram_id:
-                raise ValueError("Step belongs to another diagram")
-            if row:
-                if input_shape is not None:
-                    self.repository.update_step(int(step_id), component_id=self._ensure_component_id(input_shape))
-                return int(step_id)
-            step_shape.db_step_id = None
-
-        if input_shape is None:
-            for shape in self.diagram.shapes:
-                if isinstance(shape, ComponentBox) and str(shape.properties.get("node_type", "")).strip().lower() == "root":
-                    input_shape = shape
-                    break
-
-        if input_shape is None:
-            raise ValueError("Step needs an input component (connect a component to the circle first)")
-
-        component_id = self._ensure_component_id(input_shape)
-        step_order = self.repository.get_next_step_order(component_id)
-        title = str(step_shape.text or "Disassembly Step").strip()
-        description = str(step_shape.step_description or "").strip()
-        image_path = str(step_shape.image_path or "").strip()
-
-        step_id = self.repository.create_step(
-            component_id=component_id,
-            step_order=step_order,
-            description=description,
-            image_path=image_path,
-            action_id=None,
-            title=title,
-        )
-        # Keep display text/title aligned.
-        step_shape.text = title
-        step_shape.db_step_id = step_id
-        return step_id
-
-    def _resolve_input_shape_for_step(self, step_shape: ActionCircle) -> Optional[ComponentBox]:
-        """Find the component feeding into a step, falling back to the root."""
-        for conn in self.diagram.connections:
-            if conn.to_shape == step_shape and isinstance(conn.from_shape, ComponentBox):
-                return conn.from_shape
-
-        for arrow in self.diagram.shapes:
-            if isinstance(arrow, ArrowShape) and arrow.to_shape == step_shape and isinstance(arrow.from_shape, ComponentBox):
-                return arrow.from_shape
-        for shape in self.diagram.shapes:
-            if isinstance(shape, ComponentBox) and str(shape.properties.get("node_type", "")).strip().lower() == "root":
-                return shape
-        return None
-
-    def _ensure_action_id(self, action_shape: DiamondStep) -> Optional[int]:
-        """Return the action's storage id, creating the storage row if needed."""
-        action_id = getattr(action_shape, "db_action_id", None)
-        if action_id:
-            row = self.repository.get_action(int(action_id))
-            if isinstance(row, dict) and row.get("diagram_id") != self.diagram.diagram_id:
-                raise ValueError("Action belongs to another diagram")
-            if row:
-                return int(action_id)
-            action_shape.db_action_id = None
-
-        action_name = str(action_shape.name or action_shape.text or "Action").strip()
-        tool_val = str(action_shape.tools or "").strip()
-        root_id = self._get_root_component_id()
-        if root_id is None:
-            raise ValueError("Add a root component before saving actions")
-        action_id = self.repository.create_action(name=action_name, description="", tool_id=None, diagram_id=self.diagram.diagram_id)
-        action_shape.db_action_id = action_id
-        if action_shape.name:
-            action_shape.text = action_shape.name
-        else:
-            action_shape.name = action_name
-            action_shape.text = action_name
-        if tool_val:
-            action_shape.tools = tool_val
-        return action_id
-
-    def _resolve_step_id_for_diamond(self, diamond_shape: DiamondStep) -> Optional[int]:
-        """Return the step a diamond belongs to, inferring from connections."""
-        step_id = getattr(diamond_shape, "db_step_id", None)
-        if step_id:
-            return int(step_id)
-
-        # Try to infer from an incoming circle->diamond connection.
-        for conn in self.diagram.connections:
-            if conn.to_shape == diamond_shape and isinstance(conn.from_shape, ActionCircle):
-                inferred = self._ensure_step_id(conn.from_shape)
-                if inferred:
-                    diamond_shape.db_step_id = inferred
-                    return inferred
-        return None
+    def _ensure_action_id(self, shape):
+        return self._storage_operation('_ensure_action_id', shape)
 
     def _edit_shape_properties(self, shape):
         """Select a shape so its properties show in the panel."""
@@ -641,22 +351,19 @@ class AppController:
         command = AddShapeCommand(self.diagram, new_shape)
         self.command_history.execute(command)
         self._update_view()
-        self.view.set_status(f"Duplicated {shape.shape_type}")
+        self.view.set_status(f"Duplicated {self._shape_display_name(shape)}", FeedbackType.SUCCESS)
 
     def _delete_shape(self, shape):
         """Delete a shape, removing any arrows/connections attached to it."""
-        if not self._delete_shape_from_storage(shape):
-            return
-
         commands = [RemoveShapeCommand(self.diagram, arrow)
                     for arrow in self._get_attached_arrows(shape)]
         commands.append(RemoveShapeCommand(self.diagram, shape))
         if len(commands) == 1:
             self.command_history.execute(commands[0])
         else:
-            self.command_history.execute(MultiCommand(commands, f"Remove {shape.shape_type}"))
+            self.command_history.execute(MultiCommand(commands, f"Remove {self._shape_display_name(shape)}"))
         self._update_view()
-        self.view.set_status(f"Deleted {shape.shape_type}")
+        self.view.set_status(f"Deleted {self._shape_display_name(shape)}", FeedbackType.SUCCESS)
 
     def _get_attached_arrows(self, shape) -> list:
         """Return the arrow shapes whose endpoints reference the given shape."""
@@ -665,38 +372,36 @@ class AppController:
         return [s for s in self.diagram.shapes
                 if isinstance(s, ArrowShape) and (s.from_shape == shape or s.to_shape == shape)]
 
-    def _delete_shape_from_storage(self, shape) -> bool:
-        """Delete corresponding storage entity for a shape if it exists.
-
-        Action ordering is not compacted after deletes. If an action link is removed,
-        remaining action_order values keep their original numbers and future inserts append.
-        """
-        try:
-            if isinstance(shape, ComponentBox):
-                db_id = shape.properties.get("db_id")
-                if db_id:
-                    self.repository.delete_component(int(db_id))
-            elif isinstance(shape, ActionCircle):
-                step_id = getattr(shape, "db_step_id", None)
-                if step_id:
-                    self.repository.delete_step(int(step_id))
-            elif isinstance(shape, DiamondStep):
-                action_id = getattr(shape, "db_action_id", None)
-                if action_id:
-                    self.repository.delete_action(int(action_id))
-            return True
-        except DuplicateValueError:
-            self.view.set_status("Cannot delete in storage due to existing references.")
-            return False
-        except Exception as exc:
-            self.view.set_status(f"storage delete failed: {exc}")
-            return False
-
     def _start_connection_from(self, shape):
         """Enter connect mode starting from the given shape."""
         self.connect_mode = True
         self.connecting_from = shape
-        self.view.set_status(f"Connection started from {shape.shape_type}. Click target shape.")
+        self.view.set_status(f"Connection started from {self._shape_display_name(shape)}. Click target shape.")
+
+    @staticmethod
+    def _shape_display_name(shape):
+        """Translate internal model types into the palette's user-facing terms."""
+        if isinstance(shape, ComponentBox):
+            subtype = str(shape.properties.get("node_type", "")).lower()
+            return {"root": "Root Component", "leaf": "Leaf Component",
+                    "intermediate": "Composite Component"}.get(subtype, "Component")
+        if isinstance(shape, ActionCircle):
+            return "Action"
+        if isinstance(shape, DiamondStep):
+            return "Step"
+        return "Arrow"
+
+    def _reset_interaction(self):
+        """Leave pending connection modes without changing diagram data."""
+        self._clear_preview_line()
+        self.arrow_mode = False
+        self.connect_mode = False
+        self.connecting_from = None
+        self.dragging = False
+        self.drag_start = None
+        self.drag_shapes = []
+        self.drag_initial_positions = {}
+        self.view.canvas.config(cursor="")
 
     def add_shape(self, shape_type: str):
         """Add a new shape of the given type to the diagram."""
@@ -709,10 +414,11 @@ class AppController:
         if shape_type == "arrow":
             self.arrow_mode = True
             self.connecting_from = None
-            self.view.canvas.config(cursor="crosshair")
+            self.view.canvas.config(cursor="")
             self.view.set_status("⚡ ARROW MODE: Click source shape, then target shape (Press ESC to cancel)")
             return
 
+        self._reset_interaction()
         x, y = self._get_next_shape_position()
         shape = self._create_shape_instance(shape_type, x, y)
 
@@ -729,14 +435,12 @@ class AppController:
             if requested == "root":
                 shape.properties.setdefault("name", "Root Component")
                 shape.text = shape.properties.get("name") or "Root Component"
-            self.view.set_status(f"Added {requested.capitalize()} Component")
-        else:
-            self.view.set_status(f"Added {shape_type}")
 
         command = AddShapeCommand(self.diagram, shape)
         self.command_history.execute(command)
         self.diagram.select_shape(shape, multi_select=False)
         self._update_view()
+        self.view.set_status(f"Added {self._shape_display_name(shape)}", FeedbackType.SUCCESS)
 
     def _get_next_shape_position(self) -> Tuple[float, float]:
         """
@@ -798,15 +502,9 @@ class AppController:
 
         if self.arrow_mode or self.connect_mode:
             self._clear_preview_line()
-            self.arrow_mode = False
-            self.connect_mode = False
-            self.connecting_from = None
+            self._reset_interaction()
 
         selected = list(self.diagram.selected_shapes)
-
-        for shape in selected:
-            if not self._delete_shape_from_storage(shape):
-                return
 
         to_delete = []
         for shape in selected:
@@ -822,7 +520,7 @@ class AppController:
             self.command_history.execute(MultiCommand(commands, "Remove selected shapes"))
 
         self._update_view()
-        self.view.set_status("Deleted selected shapes")
+        self.view.set_status("Deleted selected shapes", FeedbackType.SUCCESS)
 
     def select_all(self):
         """Select every shape in the diagram."""
@@ -838,125 +536,76 @@ class AppController:
 
         if self.connect_mode:
             self.view.set_status("⚡ CONNECTION MODE ACTIVE: Click source shape, then target shape (Press C or ESC to exit)")
-            self.view.canvas.config(cursor="crosshair")
+            self.view.canvas.config(cursor="")
         else:
             self.view.set_status("Connection mode disabled")
             self.view.canvas.config(cursor="")
-            self.view.root.after(1500, lambda: self.view.set_status("Ready"))
 
     def apply_properties(self, shape, old_properties, new_properties):
-        """Apply edited properties to a shape and persist them to the storage."""
-        command = EditShapePropertiesCommand(shape, old_properties, new_properties)
-        json_only = bool(self.diagram.file_path and self.diagram.auto_sync_json)
-        # The Properties view has already collected edits into the model. Do
-        # not record a successful command until persistence accepts them.
-        id_fields = ('db_step_id', 'db_action_id', 'db_step_action_id', 'db_action_order', 'tool_id')
-        states = [(node, copy.deepcopy(node.properties) if isinstance(node, ComponentBox) else
-                   {key: getattr(node, key, None) for key in id_fields})
-                  for node in self.diagram.shapes]
-        old_product = getattr(self, 'current_product_id', None)
+        """Apply model edits; only explicit Save persists project changes."""
+        structural = {'id', 'db_id', 'db_step_id', 'db_action_id', 'db_step_action_id',
+                      'db_action_order', 'node_type', 'root_component_id', 'diagram_id', 'parent_id'}
+        new_properties = {key: value for key, value in new_properties.items() if key not in structural}
+        old_properties = {
+            key: copy.deepcopy(shape.properties[key] if isinstance(shape, ComponentBox) and key in shape.properties
+                               else getattr(shape, key, None))
+            for key in new_properties
+        }
+        new_properties = {key: value for key, value in new_properties.items()
+                          if old_properties[key] != value}
+        old_properties = {key: old_properties[key] for key in new_properties}
+        command = EditShapePropertiesCommand(shape, old_properties, new_properties, self.diagram)
         try:
-            command.execute()
-            if not json_only:
-                with self.repository.transaction():
-                    self._persist_shape_properties(shape)
-        except (ValueError, OSError) as exc:
-            self.current_product_id = old_product
-            for node, state in states:
-                if isinstance(node, ComponentBox):
-                    node.properties = state
-                else:
-                    for key, value in state.items():
-                        setattr(node, key, value)
-            command.undo()
+            if isinstance(shape, ComponentBox):
+                for field, getter in (("material_id", self.repository.get_material),
+                                      ("color_id", self.repository.get_color)):
+                    value = new_properties.get(field)
+                    if value not in (None, "") and not getter(int(value)):
+                        raise ValueError(f"Unknown {field.replace('_id', '')} selection")
+                weight = new_properties.get("weight")
+                if weight not in (None, ""):
+                    float(weight)
+            elif isinstance(shape, DiamondStep) and new_properties.get("tool_id"):
+                if not self.repository.get_tool(int(new_properties["tool_id"])):
+                    raise ValueError("Unknown tool selection")
+        except (ValueError, TypeError) as exc:
             self.view.show_error("Cannot apply changes", str(exc))
-            self.view.set_status("Changes were not saved. Correct the values and try again.")
             return False
-
-        # Persistence may assign IDs or normalize optional values. Preserve
-        # those values when the command is executed/recorded by the history.
-        if isinstance(shape, ComponentBox):
-            command.new_properties = {**new_properties, **shape.properties}
-        elif isinstance(shape, DiamondStep):
-            command.new_properties = {**new_properties, 'tool_id': shape.tool_id}
-        self.command_history.execute(command)
+        source = new_properties.get('image_path')
+        if source and not str(source).replace('\\', '/').startswith('images/') and os.path.isfile(source):
+            handler = getattr(self, 'image_handler', None) or get_image_handler()
+            kind = 'component' if isinstance(shape, ComponentBox) else 'step' if isinstance(shape, ActionCircle) else 'action'
+            product = next((s.properties.get('name') or s.text for s in self.diagram.shapes
+                            if isinstance(s, ComponentBox) and str(s.properties.get('node_type', '')).lower() == 'root'), 'Product')
+            try:
+                stored = handler.upload_image(source, entity_type=kind, product_name=product)
+            except (OSError, ValueError) as exc:
+                self.view.show_error("Cannot apply changes", f"Failed to store the selected image: {exc}")
+                return False
+            if not stored:
+                self.view.show_error("Cannot apply changes", "Failed to store the selected image.")
+                return False
+            new_properties = dict(new_properties, image_path=stored)
+            command = EditShapePropertiesCommand(shape, old_properties, new_properties, self.diagram)
+        if new_properties:
+            self.command_history.execute(command)
         self.diagram.select_shape(shape, multi_select=False)
         self._update_view()
-        if json_only:
-            self.view.set_status("Properties updated (saving to JSON...)")
-            self._schedule_auto_save_json()
-        else:
-            self.view.set_status("Properties updated (saved to JSON storage)")
+        self.view.set_status("Properties updated. Save to keep project changes.", FeedbackType.SUCCESS)
         return True
 
+    def _storage_operation(self, method, *args):
+        factory = getattr(self, 'persistence_factory', ProjectPersistence)
+        storage = factory(self.repository, self.diagram, getattr(self, 'current_product_id', None))
+        result = getattr(storage, method)(*args)
+        self.current_product_id = storage.current_product_id
+        return result
+
     def _persist_diagram(self):
-        """Atomically persist one owned diagram and its complete editable graph."""
-        roots = [s for s in self.diagram.shapes if isinstance(s, ComponentBox) and str(s.properties.get("node_type", "")).lower() == "root"]
-        if not self.diagram.shapes:
-            return
-        if len(roots) != 1:
-            raise ValueError("Saving requires exactly one root component")
-        # Roll back assigned model IDs as well as repository data after failure.
-        states = [(shape, copy.deepcopy(shape.properties) if isinstance(shape, ComponentBox) else
-                   {key:getattr(shape, key, None) for key in ("db_step_id", "db_action_id", "db_step_action_id", "db_action_order", "tool_id")})
-                  for shape in self.diagram.shapes]
-        old_product = self.current_product_id
-        try:
-            with self.repository.transaction():
-                for shape in roots + [s for s in self.diagram.shapes if s not in roots]:
-                    self._persist_shape_properties(shape)
-                self.repository.save_diagram_snapshot(self.diagram.diagram_id, self.diagram.to_dict())
-        except Exception:
-            self.current_product_id = old_product
-            for shape, state in states:
-                if isinstance(shape, ComponentBox):
-                    shape.properties = state
-                else:
-                    for key, value in state.items():
-                        setattr(shape, key, value)
-            raise
-        self.diagram.modified = False
+        self._storage_operation('save')
 
     def _persist_shape_properties(self, shape):
-        """Persist edited shape properties through the JSON repository."""
-        if isinstance(shape, ComponentBox):
-            # Older forms/projects may contain empty strings for optional IDs.
-            for field in ('color_id', 'material_id'):
-                value = shape.properties.get(field)
-                if isinstance(value, str) and not value.strip():
-                    shape.properties[field] = None
-            component_id = self._ensure_component_id(shape)
-            updates = dict(shape.properties)
-            for internal_key in ("db_id", "root_component_id", "diagram_id", "_material_category_id", "_material_subcategory_id", "_material_type_id"):
-                updates.pop(internal_key, None)
-            self.repository.update_component(int(component_id), **updates)
-            shape.properties["db_id"] = int(component_id)
-            return
-
-        if isinstance(shape, ActionCircle):
-            step_id = self._ensure_step_id(shape)
-            self.repository.update_step(
-                int(step_id), title=str(shape.text or "").strip(),
-                description=str(shape.step_description or "").strip(),
-                image_path=str(shape.image_path or "").strip(),
-            )
-            shape.db_step_id = int(step_id)
-            return
-
-        if isinstance(shape, DiamondStep):
-            action_id = self._ensure_action_id(shape)
-            if not shape.tool_id and shape.tools:
-                # Keep existing free-text diagrams saveable; catalog selections
-                # already carry an ID and must not create another tool.
-                shape.tool_id = self.repository.create_tool(str(shape.tools))
-                if getattr(self, "view", None) is not None:
-                    self.view.refresh_properties_panel()
-            self.repository.update_action(
-                int(action_id), name=str(shape.name or shape.text or "").strip(),
-                description=str(shape.description or "").strip(),
-                tool_id=shape.tool_id or None, image_path=str(shape.image_path or "").strip(),
-            )
-            shape.db_action_id = int(action_id)
+        return self._storage_operation('_persist_shape_properties', shape)
 
     def undo(self):
         """Undo the last command."""
@@ -1039,13 +688,14 @@ class AppController:
         """Create a new diagram. Existing JSON storage entries are preserved."""
         if not self.check_unsaved_changes():
             return
+        self._reset_interaction()
         self.diagram.clear()
         self.command_history.clear()
         self.current_product_id = None
         # Reset canvas to minimum size
         self.view.canvas.update_scroll_region_from_shapes([])
         self._update_view()
-        self.view.set_status("New diagram created (JSON storage preserved - use 'Load Product' to see saved diagrams)")
+        self.view.set_status("New diagram created", FeedbackType.SUCCESS)
 
     def open_diagram(self):
         """Load a diagram from a JSON file chosen by the user."""
@@ -1059,12 +709,13 @@ class AppController:
         diagram = DiagramSerializer.load_from_file(file_path)
         if diagram:
             self._detach_imported_diagram(diagram)
+            self._reset_interaction()
             self.diagram = diagram
             self.command_history.clear()
             # Update canvas scroll region to fit loaded shapes
             self.view.canvas.update_scroll_region_from_shapes(self.diagram.shapes)
             self._update_view()
-            self.view.set_status(f"Opened: {os.path.basename(file_path)}")
+            self.view.set_status(f"Opened: {os.path.basename(file_path)}", FeedbackType.SUCCESS)
         else:
             self.view.show_error("Error", "Failed to open file")
 
@@ -1081,7 +732,7 @@ class AppController:
                 if product:
                     product_name = product.get('name', 'Diagram')
             
-            self.view.set_status(f"💾 Saved to JSON storage: {product_name}")
+            self.view.set_status(f"💾 Saved to JSON storage: {product_name}", FeedbackType.SUCCESS)
             return True
         except Exception as e:
             self.view.show_error("Save Error", f"Failed to save to JSON storage: {e}")
@@ -1096,12 +747,10 @@ class AppController:
         if not file_path:
             return False
 
-        self.diagram.file_path = file_path
-
         try:
             # Save to JSON file (legacy format)
             if DiagramSerializer.save_to_file(self.diagram, file_path):
-                self.view.set_status(f"💾 Saved JSON: {os.path.basename(file_path)} (Legacy format)")
+                self.view.set_status(f"💾 Saved JSON: {os.path.basename(file_path)} (Legacy format)", FeedbackType.SUCCESS)
                 return True
             else:
                 self.view.show_error("Error", "Failed to save file")
@@ -1120,20 +769,22 @@ class AppController:
             self.view.set_status("Canvas is already empty")
             return
 
-        from tkinter import messagebox
-        if not messagebox.askyesno("Clear Canvas", "Are you sure you want to clear the canvas?"):
+        if not self.view.ask_confirmation("Clear Canvas", "Are you sure you want to clear the canvas?"):
             return
 
-        self.diagram.clear()
+        self.diagram.clear_selection()
+        self.diagram.shapes.clear()
+        self.diagram.connections.clear()
         self.command_history.clear()
         # Reset canvas to minimum size
         self.view.canvas.update_scroll_region_from_shapes([])
         self._update_view()
-        self.current_product_id = None
-        self.view.set_status("Canvas cleared")
+        self.diagram.modified = True
+        self.view.set_status("Canvas cleared", FeedbackType.SUCCESS)
 
     def check_unsaved_changes(self) -> bool:
         """Prompt to save unsaved changes; return False to cancel the action."""
+        self._cancel_auto_save()
         if not self.diagram.modified:
             return True
 
@@ -1144,22 +795,23 @@ class AppController:
         elif result == 'discard':
             return True
         else:
+            self.view.set_status("Operation cancelled.", FeedbackType.INFO)
             return False
 
     def show_add_color_dialog(self):
         """Open the dialog for adding a new color."""
-        return AddColorDialog(self.view.root, self).result
+        return self.view.show_catalog_dialog('color', self)
 
    
 
     def show_manage_colors_dialog(self):
         """Open the dialog for managing colors."""
-        ManageColorsDialog(self.view.root, self)
+        self.view.show_catalog_dialog('color', self, manage=True)
 
 
     def show_manage_materials_dialog(self):
         """Open the dialog for managing materials."""
-        ManageMaterialsDialog(self.view.root, self)
+        self.view.show_catalog_dialog('material', self, manage=True)
 
     def show_add_catalog_dialog(self, kind):
         return {'color': self.show_add_color_dialog,
@@ -1167,7 +819,7 @@ class AppController:
                 'tool': self.show_add_tool_dialog}[kind]()
 
     def show_manage_tools_dialog(self):
-        ManageToolsDialog(self.view.root, self)
+        self.view.show_catalog_dialog('tool', self, manage=True)
 
     def delete_tool(self, tool_id):
         # Protect unsaved diagrams as well as references in repository records.
@@ -1180,40 +832,47 @@ class AppController:
             raise ValueError("The tool cannot be deleted because it is assigned to an action.") from exc
         if success:
             self.view.refresh_properties_panel()
+        if success:
+            self.view.set_status("Tool deleted successfully.", FeedbackType.SUCCESS)
         return success
 
     def add_new_color(self, name, hex_code, r, g, b):
         try:
             color_id = self.repository.create_color(name, hex_code, r, g, b)
             self.view.refresh_properties_panel()
-            self.view.set_status(f"Added new color: {name}")
+            self.view.set_status(f"Added new color: {name}", FeedbackType.SUCCESS)
             return color_id
         except DuplicateValueError as exc:
             raise ValueError("Color already exists or violates a JSON storage rule.") from exc
 
     def delete_color(self, color_id: int) -> bool:
         """Deletes a color and refreshes the properties panel if needed."""
+        if any(isinstance(shape, ComponentBox) and shape.properties.get("color_id") == color_id
+               for shape in self.diagram.shapes):
+            raise ValueError("The color cannot be deleted because it is assigned to a component.")
         try:
             success = self.repository.delete_color(color_id)
             if success:
                 # If the property panel is open, we refresh it
                 if hasattr(self.view, 'refresh_properties_panel'):
                     self.view.refresh_properties_panel()
+            if success:
+                self.view.set_status("Color deleted successfully.", FeedbackType.SUCCESS)
             return success
-        except DuplicateValueError:
+        except ValueError:
             raise ValueError("The color cannot be deleted because it is already assigned to a component.")
         except Exception as e:
             raise Exception(f"Error when deleting the color: {e}")
 
     def show_add_material_dialog(self):
         """Open the dialog for adding a new material."""
-        return AddMaterialDialog(self.view.root, self).result
+        return self.view.show_catalog_dialog('material', self)
 
     def add_new_material_category(self, name):
         try:
             category_id = self.repository.create_material_category(name)
             self.view.refresh_properties_panel()
-            self.view.set_status(f"Added new material category: {name}")
+            self.view.set_status(f"Added new material category: {name}", FeedbackType.SUCCESS)
             return category_id
         except DuplicateValueError as exc:
             raise ValueError("Material category already exists.") from exc
@@ -1222,7 +881,7 @@ class AppController:
         try:
             subcategory_id = self.repository.create_material_subcategory(category_id, name)
             self.view.refresh_properties_panel()
-            self.view.set_status(f"Added new material subcategory: {name}")
+            self.view.set_status(f"Added new material subcategory: {name}", FeedbackType.SUCCESS)
             return subcategory_id
         except DuplicateValueError as exc:
             raise ValueError("Material subcategory already exists or is invalid.") from exc
@@ -1231,7 +890,7 @@ class AppController:
         try:
             type_id = self.repository.create_material_type(category_id, name, subcategory_id)
             self.view.refresh_properties_panel()
-            self.view.set_status(f"Added new material type: {name}")
+            self.view.set_status(f"Added new material type: {name}", FeedbackType.SUCCESS)
             return type_id
         except DuplicateValueError as exc:
             raise ValueError("Material type already exists or is invalid.") from exc
@@ -1247,75 +906,47 @@ class AppController:
                 technical_name=technical_name,
             )
             self.view.refresh_properties_panel()
-            self.view.set_status(f"Added new material: {name}")
+            self.view.set_status(f"Added new material: {name}", FeedbackType.SUCCESS)
             return material_id
         except DuplicateValueError as exc:
             raise ValueError("Material could not be saved because the selection is already in use or invalid.") from exc
 
     def delete_material(self, material_id: int) -> bool:
         """Deletes a material and refreshes the view."""
+        if any(isinstance(shape, ComponentBox) and shape.properties.get("material_id") == material_id
+               for shape in self.diagram.shapes):
+            raise ValueError("The material cannot be deleted because it is assigned to a component.")
         try:
             success = self.repository.delete_material(material_id)
             if success:
                 if hasattr(self.view, 'refresh_properties_panel'):
                     self.view.refresh_properties_panel()
+            if success:
+                self.view.set_status("Material deleted successfully.", FeedbackType.SUCCESS)
             return success
-        except DuplicateValueError:
+        except ValueError:
             raise ValueError("The material cannot be deleted because it is already assigned to a component.")
         except Exception as e:
             raise Exception(f"Error when deleting a material: {e}")
 
     def show_add_tool_dialog(self):
         """Open the dialog for adding a new tool."""
-        return AddToolDialog(self.view.root, self).result
+        return self.view.show_catalog_dialog('tool', self)
 
     def add_new_tool(self, name, category):
         try:
             tool_id = self.repository.create_tool(name, category)
             self.view.refresh_properties_panel()
-            self.view.set_status(f"Added new tool: {name}")
+            self.view.set_status(f"Added new tool: {name}", FeedbackType.SUCCESS)
             return tool_id
         except DuplicateValueError as exc:
             raise ValueError("Tool already exists or violates a JSON storage rule.") from exc
 
-    def _schedule_auto_save_json(self):
-        """Schedule auto-save to JSON with minimal debounce (0.2 second delay)."""
-        # Cancel existing timer if any
+    def _cancel_auto_save(self):
+        """Cancel legacy pending callbacks before prompting or replacing a project."""
         if self.auto_save_timer:
             self.view.root.after_cancel(self.auto_save_timer)
-        
-        # Only auto-save if diagram was loaded from JSON and auto-sync is enabled
-        if self.diagram.file_path and self.diagram.auto_sync_json:
-            # Schedule new save after delay
-            self.auto_save_timer = self.view.root.after(
-                self.auto_save_delay, 
-                self._auto_save_to_json
-            )
-    
-    def _auto_save_to_json(self):
-        """Auto-save diagram to JSON file."""
-        if not self.diagram.file_path:
-            return
-        
-        try:
-            from datetime import datetime
-            
-            # Export to JSON with images
-            success = self.json_exporter.export_diagram(
-                self.diagram,
-                self.diagram.file_path,
-                self.current_product_id,
-                copy_images=True
-            )
-            
-            if success:
-                self.diagram.last_json_sync = datetime.now()
-                # Show brief notification
-                self.view.set_status(f"✓ Auto-saved to {os.path.basename(self.diagram.file_path)}")
-                # Clear status after 1.5 seconds
-                self.view.root.after(1500, lambda: self.view.set_status("Ready"))
-        except Exception:
-            pass
+            self.auto_save_timer = None
 
     def _sync_navigator(self):
         navigator = getattr(self.view, 'navigator', None)
@@ -1373,8 +1004,7 @@ class AppController:
 
     def show_product_list(self):
         """Show product list dialog to load a saved diagram."""
-        from ..views.product_list_dialog import ProductListDialog
-        ProductListDialog(self.view.root, self, self.load_product_diagram)
+        self.view.show_product_list(self, self.load_product_diagram)
     
     def load_product_diagram(self, product_id: int):
         """
@@ -1391,6 +1021,7 @@ class AppController:
             diagram = self.diagram_loader.load_product_diagram(product_id)
             
             if diagram:
+                self._reset_interaction()
                 self.diagram = diagram
                 self.current_product_id = product_id
                 self.command_history.clear()
@@ -1402,7 +1033,7 @@ class AppController:
                 # Get product info for status
                 product = self.repository.get_product(product_id)
                 product_name = product.get('name', 'Product') if product else 'Product'
-                self.view.set_status(f"Loaded: {product_name} (ID: {product_id})")
+                self.view.set_status(f"Loaded: {product_name} (ID: {product_id})", FeedbackType.SUCCESS)
             else:
                 self.view.show_error("Error", f"Failed to load product diagram (ID: {product_id})")
                 
@@ -1428,10 +1059,10 @@ class AppController:
             if warnings:
                 self.view.set_status(
                     f"Exported {os.path.basename(file_path)}; "
-                    f"skipped {len(warnings)} missing image(s)"
+                    f"skipped {len(warnings)} missing image(s)", FeedbackType.WARNING
                 )
             else:
-                self.view.set_status(f"Exported project: {os.path.basename(file_path)}")
+                self.view.set_status(f"Exported project: {os.path.basename(file_path)}", FeedbackType.SUCCESS)
         except Exception as exc:
             # Do not hide the real filesystem/serialization/ZIP error.
             self.view.show_error(
@@ -1449,7 +1080,7 @@ class AppController:
             return
         try:
             result = self.document_export_service.export(self.diagram, file_path, format_id)
-            self.view.set_status(f"Exported {label}: {os.path.basename(result)}")
+            self.view.set_status(f"Exported {label}: {os.path.basename(result)}", FeedbackType.SUCCESS)
         except Exception as exc:
             self.view.show_error(f"{label} export failed", f"Could not export {label}:\n\n{type(exc).__name__}: {exc}")
             import traceback
@@ -1488,6 +1119,7 @@ class AppController:
                 self.view.show_error("Error", "Failed to import project")
                 return
             self._detach_imported_diagram(diagram)
+            self._reset_interaction()
             self.diagram = diagram
             self.diagram.file_path = None
             self.diagram.auto_sync_json = False
@@ -1498,8 +1130,9 @@ class AppController:
             self._update_view()
             notices = getattr(diagram, "import_warnings", [])
             if notices:
-                self.view.show_error("Import warnings", "\n".join(notices))
-            self.view.set_status(f"Imported project: {os.path.basename(file_path)}")
+                self.view.set_status("Imported with warnings: " + "; ".join(notices), FeedbackType.WARNING)
+            else:
+                self.view.set_status(f"Imported project: {os.path.basename(file_path)}", FeedbackType.SUCCESS)
         except Exception as exc:
             self.view.show_error("Error", f"Import failed: {exc}")
 

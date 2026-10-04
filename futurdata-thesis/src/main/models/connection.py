@@ -17,7 +17,6 @@ class Connection:
         self.connection_type = connection_type
         self.from_anchor = from_anchor
         self.to_anchor = to_anchor
-        self.arrow_id = None
 
     @classmethod
     def reset_counter(cls):

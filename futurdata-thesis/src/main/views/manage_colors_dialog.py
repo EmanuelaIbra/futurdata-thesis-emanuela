@@ -78,7 +78,6 @@ class ManageColorsDialog(tk.Toplevel):
             try:
                 self.controller.delete_color(color_id)
                 self.load_colors()
-                messagebox.showinfo("Success", "Color deleted successfully.", parent=self)
             except ValueError as e:
                 messagebox.showerror("Constraint Error", str(e), parent=self)
             except Exception as e:

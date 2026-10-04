@@ -39,15 +39,15 @@ def test_zoom_preserves_model_and_cursor_and_connections(root):
     canvas.move_items(a, 25, 30)
     canvas.update_connections_for_shapes([a], diagram)
     expected = [v * 2 for point in connection.get_endpoints() for v in point]
-    assert canvas.coords(connection.arrow_id) == pytest.approx(expected)
+    assert canvas.coords(canvas._connection_items[connection]) == pytest.approx(expected)
     canvas.redraw_all(diagram)
-    assert canvas.coords(a.shape_id) == pytest.approx([v * 2 for v in a.get_bounds()])
+    assert canvas.coords(canvas._canvas_items[a]['body']) == pytest.approx([v * 2 for v in a.get_bounds()])
     canvas._apply_zoom(100)
     assert canvas.zoom_factor == 4
     canvas._apply_zoom(.001)
     assert canvas.zoom_factor == .25
     canvas.reset_zoom()
-    assert canvas.coords(a.shape_id) == pytest.approx(a.get_bounds())
+    assert canvas.coords(canvas._canvas_items[a]['body']) == pytest.approx(a.get_bounds())
 
 
 def test_controller_drag_uses_model_coordinates(root):
@@ -68,7 +68,7 @@ def test_controller_drag_uses_model_coordinates(root):
     controller._auto_scroll_viewport = lambda *args: None
     controller.on_canvas_drag(SimpleNamespace(x=440, y=420))
     assert (shape.x, shape.y) == pytest.approx((220, 210))
-    assert canvas.coords(shape.shape_id) == pytest.approx([v * 2 for v in shape.get_bounds()])
+    assert canvas.coords(canvas._canvas_items[shape]['body']) == pytest.approx([v * 2 for v in shape.get_bounds()])
 
 
 def test_properties_content_scrolls_without_growing_panel(root):

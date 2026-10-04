@@ -117,10 +117,9 @@ class Diagram:
         return (min_x, min_y, max_x, max_y)
 
     def to_dict(self) -> dict:
-        self.metadata["modified"] = datetime.now().isoformat()
         return {
             "diagram_id": self.diagram_id,
-            "metadata": self.metadata,
+            "metadata": dict(self.metadata),
             "diagram": {
                 "canvas_size": self.canvas_size,
                 "zoom_level": self.zoom_level,

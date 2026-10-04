@@ -76,20 +76,20 @@ def test_native_canvas_grows_and_keeps_text_inside_shape(kind):
         diagram = Diagram()
         diagram.shapes.extend([shape, neighbor])
         canvas.redraw_all(diagram)
-        left, top, right, bottom = canvas.bbox(shape.text_id)
+        left, top, right, bottom = canvas.bbox(canvas._canvas_items[shape]['text'])
         # All label corners must lie within curved as well as rectangular shapes.
         for x, y in ((left, top), (right, top), (left, bottom), (right, bottom)):
-            assert shape.contains_point(x, y)
-        assert neighbor.get_bounds()[1] >= shape.get_bounds()[3] + 20
-        assert shape._display_text.replace('\n', '') == shape.text
+            assert canvas.render_shape(shape).contains_point(x, y)
+        assert canvas.render_bounds(neighbor)[1] >= canvas.render_bounds(shape)[3] + 20
+        assert canvas.render_shape(shape)._display_text.replace('\n', '') == shape.text
         positions = [(s.x, s.y) for s in diagram.shapes]
         canvas.redraw_all(diagram)
         assert positions == [(s.x, s.y) for s in diagram.shapes]
         for zoom in (0.4, 1.0, 2.0):
             canvas._apply_zoom(zoom / canvas.zoom_factor)
-            bounds = canvas.bbox(shape.text_id)
+            bounds = canvas.bbox(canvas._canvas_items[shape]['text'])
             for x, y in ((bounds[0], bounds[1]), (bounds[2], bounds[3])):
-                assert shape.contains_point(x / zoom, y / zoom)
+                assert canvas.render_shape(shape).contains_point(x / zoom, y / zoom)
     finally:
         root.destroy()
 

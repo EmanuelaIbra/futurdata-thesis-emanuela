@@ -374,7 +374,7 @@ def test_editing_other_properties_keeps_exact_custom_material(setup):
     repo, _ = setup
     mid = repo.create_material("Custom alloy", category_id=2, subcategory_id=4)
     panel = PropertiesPanel.__new__(PropertiesPanel)
-    panel.repository = repo
+    panel.data_provider = repo
     value = lambda text: SimpleNamespace(get=lambda: text)
     widget = SimpleNamespace(category_map={"Metal":2}, subcategory_map={"Non-Ferrous":4}, type_map={}, category_var=value("Metal"), subcategory_var=value("Non-Ferrous"), type_var=value(""), selected_material_id=mid, material_data={mid:repo.get_material(mid)})
     assert panel._get_selected_material_id(widget) == mid

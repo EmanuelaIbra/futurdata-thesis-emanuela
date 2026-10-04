@@ -20,7 +20,7 @@ def test_contrast(canvas, color, expected):
     shape.properties.update(node_type="Leaf", color_id=1)
     canvas.color_resolver = lambda _: {"hex_code": color}
     canvas.draw_shape(shape)
-    assert canvas.itemcget(shape.text_id, "fill") == expected
+    assert canvas.itemcget(canvas._canvas_items[shape]['text'], "fill") == expected
 
 @pytest.mark.parametrize("size", [(200, 100), (100, 200)])
 def test_image_layout_and_lifecycle(canvas, tmp_path, size):
@@ -34,16 +34,16 @@ def test_image_layout_and_lifecycle(canvas, tmp_path, size):
     diagram.shapes = [shape]
     canvas.redraw_all(diagram)
     item, _, width, height, photo = canvas._component_images[shape]
-    assert canvas.itemcget(shape.shape_id, "fill") == "white"
-    assert canvas.itemcget(shape.text_id, "fill") == "black"
+    assert canvas.itemcget(canvas._canvas_items[shape]['body'], "fill") == "white"
+    assert canvas.itemcget(canvas._canvas_items[shape]['text'], "fill") == "black"
     pixels = photo._PhotoImage__photo
     colored = [(x, y) for y in range(photo.height()) for x in range(photo.width())
                if pixels.get(x, y) == (255, 0, 0)]
     xs, ys = zip(*colored)
     ratio = (max(xs) - min(xs) + 1) / (max(ys) - min(ys) + 1)
     assert ratio == pytest.approx(size[0] / size[1], rel=.04)
-    assert canvas.bbox(item)[3] <= canvas.bbox(shape.text_id)[1]
-    assert canvas.bbox(shape.text_id)[3] < shape.get_bounds()[3]
+    assert canvas.bbox(item)[3] <= canvas.bbox(canvas._canvas_items[shape]['text'])[1]
+    assert canvas.bbox(canvas._canvas_items[shape]['text'])[3] < canvas.render_bounds(shape)[3]
     before = canvas.coords(item)
     shape.move(15, 20)
     canvas.move_items(shape, 15, 20)
@@ -57,7 +57,7 @@ def test_image_layout_and_lifecycle(canvas, tmp_path, size):
     canvas.draw_shape(shape)
     assert not canvas._component_images
     assert all(canvas.type(i) != "image" for i in canvas.find_all())
-    assert canvas.itemcget(shape.text_id, "fill") == "white"
+    assert canvas.itemcget(canvas._canvas_items[shape]['text'], "fill") == "white"
 
 
 def test_missing_and_corrupt_image(canvas, tmp_path):
@@ -71,7 +71,7 @@ def test_missing_and_corrupt_image(canvas, tmp_path):
         shape.properties["image_path"] = str(path)
         canvas.draw_shape(shape)
         assert not canvas._component_images
-        assert canvas.itemcget(shape.text_id, "fill") == "white"
+        assert canvas.itemcget(canvas._canvas_items[shape]['text'], "fill") == "white"
         assert shape.HEIGHT == ComponentBox.HEIGHT
 
 
@@ -82,9 +82,9 @@ def test_transparent_catalog_color_uses_canvas_background(canvas, background, ex
     shape.properties.update(node_type="Leaf", color_id=1)
     canvas.color_resolver = lambda _: {"name": "Transparent", "hex_code": "#000000"}
     canvas.draw_shape(shape)
-    assert canvas.itemcget(shape.shape_id, "fill") == ""
-    assert canvas.itemcget(shape.text_id, "fill") == expected
+    assert canvas.itemcget(canvas._canvas_items[shape]['body'], "fill") == ""
+    assert canvas.itemcget(canvas._canvas_items[shape]['text'], "fill") == expected
     canvas.color_resolver = lambda _: {"name": "Black", "hex_code": "#000000"}
     canvas.draw_shape(shape)
-    assert canvas.itemcget(shape.shape_id, "fill") == "#000000"
-    assert canvas.itemcget(shape.text_id, "fill") == "white"
+    assert canvas.itemcget(canvas._canvas_items[shape]['body'], "fill") == "#000000"
+    assert canvas.itemcget(canvas._canvas_items[shape]['text'], "fill") == "white"

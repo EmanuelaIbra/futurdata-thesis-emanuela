@@ -2,12 +2,14 @@ import tkinter as tk
 from tkinter import ttk
 from typing import Optional, Callable, Dict, Any
 
+from .selector_wheel import create_combobox
+
 from ..models import Shape, ActionCircle, DiamondStep, ComponentBox
 
 
 class PropertiesPanel(ttk.Frame):
     """
-    Dynamic Properties Panel that loads fields from JSON schema.
+    Properties editor using controller-provided schemas and catalogs.
 
     Benefits:
     - Add new column to JSON repository = new field appears in UI automatically
@@ -23,7 +25,7 @@ class PropertiesPanel(ttk.Frame):
         self.current_shape: Optional[Shape] = None
         if data_provider is None:
             raise ValueError("PropertiesPanel requires a controller data_provider")
-        self.repository = data_provider
+        self.data_provider = data_provider
 
         # Store dynamic field widgets
         self.dynamic_fields: Dict[str, Any] = {}
@@ -73,29 +75,8 @@ class PropertiesPanel(ttk.Frame):
 
         self._show_empty_state()
 
-    @staticmethod
-    def _block_selector_wheel(widget, path):
-        """Stop wheel defaults on this widget only, before class bindings run."""
-        for event in ("<MouseWheel>", "<Shift-MouseWheel>",
-                      "<Button-4>", "<Button-5>",
-                      "<Shift-Button-4>", "<Shift-Button-5>"):
-            widget.tk.call("bind", path, event, "break")
-
     def _create_combobox(self, parent, **options):
-        widget = ttk.Combobox(parent, **options)
-        self._block_selector_wheel(widget, str(widget))
-
-        def protect_dropdown():
-            # ttk creates its popup in Tcl, so bind its native widget paths.
-            popup = widget.tk.call("ttk::combobox::PopdownWindow", str(widget))
-            pending = [popup]
-            while pending:
-                path = pending.pop()
-                self._block_selector_wheel(widget, path)
-                pending.extend(widget.tk.splitlist(widget.tk.call("winfo", "children", path)))
-
-        widget.configure(postcommand=protect_dropdown)
-        return widget
+        return create_combobox(parent, **options)
 
     def _show_empty_state(self):
         """Show empty state when no shape is selected."""
@@ -246,65 +227,6 @@ class PropertiesPanel(ttk.Frame):
             widget.grid(row=row, column=1, sticky="ew", pady=3)
             widget.set(str(value) if value else "g")
 
-        elif field_name == 'image_path':
-            # Upload button only (no text field showing path)
-            frame = ttk.Frame(parent)
-            frame.grid(row=row, column=1, sticky="ew", pady=3)
-            
-            # Hidden widget to store the path value
-            widget = ttk.Entry(frame, width=0)
-            widget.pack_forget()  # Don't show it
-            widget.insert(0, str(value) if value else "")
-            
-            def browse_and_upload_image():
-                from tkinter import filedialog, messagebox
-                from ..utils.image_handler import get_image_handler
-                
-                filename = filedialog.askopenfilename(
-                    title="Select Image",
-                    filetypes=[
-                        ("Image files", "*.png *.jpg *.jpeg *.gif *.bmp *.webp"),
-                        ("All files", "*.*")
-                    ]
-                )
-                if filename:
-                    # Determine entity type based on current shape
-                    entity_type = "component"
-                    entity_id = None
-                    product_name = None
-                    
-                    if self.current_shape:
-                        from ..models import ComponentBox, ActionCircle, DiamondStep
-                        
-                        # Get product name from root component
-                        product_name = self._get_product_name()
-                        
-                        if isinstance(self.current_shape, DiamondStep):
-                            entity_type = "action"
-                            entity_id = getattr(self.current_shape, 'db_action_id', None)
-                        elif isinstance(self.current_shape, ActionCircle):
-                            entity_type = "step"
-                            entity_id = getattr(self.current_shape, 'db_step_id', None)
-                        elif isinstance(self.current_shape, ComponentBox):
-                            entity_type = "component"
-                            entity_id = self.current_shape.properties.get('db_id')
-                    
-                    # Upload image with product name
-                    image_handler = get_image_handler()
-                    stored_path = image_handler.upload_image(filename, entity_type, entity_id, product_name)
-                    
-                    if stored_path:
-                        widget.delete(0, tk.END)
-                        widget.insert(0, stored_path)
-                        # Update image preview
-                        self._update_image_preview(stored_path)
-                        messagebox.showinfo("Success", "Image uploaded successfully!")
-                    else:
-                        messagebox.showerror("Error", "Failed to upload image. Please check the file format.")
-            
-            browse_btn = ttk.Button(frame, text="Upload Image", command=browse_and_upload_image, width=15)
-            browse_btn.pack(side="left")
-
         else:
             # Default: Entry widget
             widget = ttk.Entry(parent, width=25)
@@ -389,7 +311,7 @@ class PropertiesPanel(ttk.Frame):
         old_names = getattr(widget, f'{kind}_map', {})
         if selected is None:
             selected = old_names.get(widget.get(), widget.get())
-        rows = getattr(self.repository, f'get_all_{kind}s')()
+        rows = getattr(self.data_provider, f'get_all_{kind}s')()
         names = {row['name']: row['id'] for row in rows}
         reverse = {row['id']: row['name'] for row in rows}
         setattr(widget, f'{kind}_map', names)
@@ -404,7 +326,7 @@ class PropertiesPanel(ttk.Frame):
         widget.set(label)
 
     def _refresh_saved_materials(self, widget):
-        rows = self.repository.get_all_materials()
+        rows = self.data_provider.get_all_materials()
         widget.material_rows = rows
         widget.material_data = {row['id']: row for row in rows}
         counts = {}
@@ -433,7 +355,7 @@ class PropertiesPanel(ttk.Frame):
     def _setup_material_hierarchy_widget(self, widget):
         """Configure category/subcategory/type controls for component material selection."""
         widget.selected_material_id = None
-        categories = self.repository.get_all_material_categories()
+        categories = self.data_provider.get_all_material_categories()
         widget.category_map = {c["name"]: c["id"] for c in categories}
         widget.category_map_reverse = {c["id"]: c["name"] for c in categories}
         # Keep the original hierarchy and expose named materials in the same selector.
@@ -467,7 +389,7 @@ class PropertiesPanel(ttk.Frame):
     def _refresh_material_subcategories(self, widget, select_id=None):
         """Refresh subcategory options for the selected category."""
         category_id = widget.category_map.get(widget.category_var.get())
-        subcategories = self.repository.get_subcategories_by_category(category_id) if category_id else []
+        subcategories = self.data_provider.get_subcategories_by_category(category_id) if category_id else []
         widget.subcategory_map = {s["name"]: s["id"] for s in subcategories}
         widget.subcategory_map_reverse = {s["id"]: s["name"] for s in subcategories}
 
@@ -489,9 +411,9 @@ class PropertiesPanel(ttk.Frame):
 
         types = []
         if category_id:
-            types = self.repository.get_types_by_category(category_id, subcategory_id)
+            types = self.data_provider.get_types_by_category(category_id, subcategory_id)
             if not types and subcategory_id is None:
-                types = self.repository.get_types_by_category(category_id, None)
+                types = self.data_provider.get_types_by_category(category_id, None)
 
         widget.type_map = {t["name"]: t["id"] for t in types}
         widget.type_map_reverse = {t["id"]: t["name"] for t in types}
@@ -537,19 +459,11 @@ class PropertiesPanel(ttk.Frame):
         if not category_id:
             return selected_id
 
-        return self.repository.resolve_material_selection(category_id, subcategory_id, type_id)
+        return self.data_provider.resolve_material_selection(category_id, subcategory_id, type_id)
 
     def _load_component_properties(self, shape: ComponentBox):
         """Load component properties dynamically from JSON schema."""
         self._clear_dynamic_fields()
-
-        db_id = shape.properties.get("db_id")
-        if db_id:
-            db_row = self.repository.get_component(int(db_id))
-            if db_row:
-                for key, value in db_row.items():
-                    if key in shape.properties:
-                        shape.properties[key] = value
 
         node_type = str(shape.properties.get('node_type', '')).strip().lower()
         if node_type == "root":
@@ -561,7 +475,7 @@ class PropertiesPanel(ttk.Frame):
             component_kind = "intermediate"
 
         # Load fields from the correct JSON repository component table.
-        fields = self.repository.get_component_fields(component_kind)
+        fields = self.data_provider.get_component_fields(component_kind)
         fields_by_name = {field['name']: field for field in fields}
         show_material_field = node_type == "leaf"
         show_color_field = node_type == "leaf"
@@ -595,7 +509,7 @@ class PropertiesPanel(ttk.Frame):
         """Load action properties dynamically from JSON schema."""
         self._clear_dynamic_fields()
 
-        fields = self.repository.get_action_fields()
+        fields = self.data_provider.get_action_fields()
 
         shape_values = {
             'name': shape.name,
@@ -603,18 +517,6 @@ class PropertiesPanel(ttk.Frame):
             'tool_id': shape.tool_id,
             'image_path': shape.image_path
         }
-
-        action_db_id = getattr(shape, "db_action_id", None)
-        if action_db_id:
-            db_row = self.repository.get_action(int(action_db_id))
-            if db_row:
-                shape_values.update(db_row)
-                shape.name = db_row.get('name', shape.name)
-                shape.description = db_row.get('description', shape.description)
-                shape.tool_id = db_row.get('tool_id', shape.tool_id)
-                shape.tools = db_row.get('tool_name') or shape.tools
-                shape.image_path = db_row.get('image_path', shape.image_path)
-                shape.text = shape.name or shape.text
 
         shape_values['tool_id'] = shape.tool_id or shape.tools or ""
 
@@ -628,22 +530,13 @@ class PropertiesPanel(ttk.Frame):
         """Load step properties dynamically from JSON schema."""
         self._clear_dynamic_fields()
 
-        fields = self.repository.get_step_fields()
+        fields = self.data_provider.get_step_fields()
 
         shape_values = {
             'title': shape.text,
             'description': shape.step_description,
             'image_path': shape.image_path
         }
-
-        step_db_id = getattr(shape, "db_step_id", None)
-        if step_db_id:
-            db_row = self.repository.get_step(int(step_db_id))
-            if db_row:
-                shape_values.update(db_row)
-                shape.step_description = db_row.get('description', shape.step_description)
-                shape.text = db_row.get('title', shape.text) or shape.text
-                shape.image_path = db_row.get('image_path', shape.image_path)
 
         row_num = 0
 
@@ -659,7 +552,10 @@ class PropertiesPanel(ttk.Frame):
         """Load shape properties into the panel."""
         self.current_shape = shape
 
-        if shape is None:
+        if not isinstance(shape, (ComponentBox, ActionCircle, DiamondStep)):
+            self._clear_dynamic_fields()
+            self.empty_label.configure(text=("Select a shape to\nedit its properties" if shape is None
+                                             else "No editable properties for this connection."))
             self._show_empty_state()
             return
 
@@ -697,8 +593,7 @@ class PropertiesPanel(ttk.Frame):
             return
 
         old_properties = self._get_current_properties()
-        self._update_shape_properties()
-        new_properties = self._get_current_properties()
+        new_properties = self._collect_proposed_properties()
 
         if self.on_apply_callback:
             self.on_apply_callback(self.current_shape, old_properties, new_properties)
@@ -712,7 +607,6 @@ class PropertiesPanel(ttk.Frame):
 
         if isinstance(self.current_shape, ActionCircle):
             properties.update({
-                "title": self.current_shape.text,
                 "step_description": self.current_shape.step_description,
                 "image_path": self.current_shape.image_path
             })
@@ -730,62 +624,32 @@ class PropertiesPanel(ttk.Frame):
             properties.update(self.current_shape.properties)
         return properties
 
-    def _update_shape_properties(self):
-        """Update shape properties from widget values."""
-        if self.current_shape is None:
-            return
-
-        if isinstance(self.current_shape, ComponentBox):
-            # We save the original node type before updating 
-            original_node_type = self.current_shape.properties.get('node_type')
-
-            for field_name, widget in self.dynamic_fields.items():
-                # Avoid processing structural control fields like UI Labels
-                if field_name in ['node_type', 'id', 'parent_id']:
-                    continue
-
-                value = self._get_widget_value(widget)
-                self.current_shape.properties[field_name] = value
-                
-                # Update the current shape's hex code based on the color selected in the dropdown
-                if field_name == 'color_id' and isinstance(widget, ttk.Combobox):
-                    color_name = widget.get()
-                    if hasattr(widget, 'color_hex_map') and color_name in widget.color_hex_map:
-                        self.current_shape.properties['hex_code'] = widget.color_hex_map[color_name]
-                    else:
-                        self.current_shape.properties['hex_code'] = None
-
-            # We safely restore the real node type in the properties dictionary
-            if original_node_type is not None:
-                self.current_shape.properties['node_type'] = original_node_type
-
-            # We synchronize the text of the graphical object so that the name never disappears
-            if 'name' in self.current_shape.properties and self.current_shape.properties['name']:
-                self.current_shape.text = str(self.current_shape.properties['name'])
-
-        elif isinstance(self.current_shape, ActionCircle):
-            if 'title' in self.dynamic_fields:
-                self.current_shape.text = self._get_widget_value(self.dynamic_fields['title'])
-            if 'description' in self.dynamic_fields:
-                self.current_shape.step_description = self._get_widget_value(self.dynamic_fields['description'])
-            if 'image_path' in self.dynamic_fields:
-                self.current_shape.image_path = self._get_widget_value(self.dynamic_fields['image_path'])
-
-        elif isinstance(self.current_shape, DiamondStep):
-            if 'name' in self.dynamic_fields:
-                self.current_shape.name = self._get_widget_value(self.dynamic_fields['name'])
-                self.current_shape.text = self.current_shape.name
-            if 'description' in self.dynamic_fields:
-                self.current_shape.description = self._get_widget_value(self.dynamic_fields['description'])
-            if 'tool_id' in self.dynamic_fields:
-                tool_widget = self.dynamic_fields['tool_id']
-                name = tool_widget.get()
-                self.current_shape.tools = name
-                self.current_shape.tool_id = next(
-                    (key for key, label in getattr(tool_widget, 'tool_map_reverse', {}).items()
-                     if label == name), None)
-            if 'image_path' in self.dynamic_fields:
-                self.current_shape.image_path = self._get_widget_value(self.dynamic_fields['image_path'])
+    def _collect_proposed_properties(self):
+        """Read form input without changing the active shape."""
+        proposed = {}
+        shape = self.current_shape
+        for field, widget in self.dynamic_fields.items():
+            if field in ('node_type', 'id', 'parent_id'):
+                continue
+            value = self._get_widget_value(widget)
+            if isinstance(shape, ComponentBox):
+                proposed[field] = value
+                if field == 'color_id':
+                    proposed['hex_code'] = getattr(widget, 'color_hex_map', {}).get(widget.get())
+            elif isinstance(shape, ActionCircle):
+                proposed[{'title': 'text', 'description': 'step_description'}.get(field, field)] = value
+            elif isinstance(shape, DiamondStep):
+                proposed[field] = value
+                if field == 'tool_id':
+                    proposed['tools'] = widget.get()
+                    proposed['tool_id'] = next(
+                        (key for key, label in getattr(widget, 'tool_map_reverse', {}).items()
+                         if label == widget.get()), None)
+        if isinstance(shape, ComponentBox) and 'name' in self.dynamic_fields and proposed.get('name'):
+            proposed['text'] = str(proposed['name'])
+        elif isinstance(shape, DiamondStep) and 'name' in self.dynamic_fields:
+            proposed['text'] = proposed['name']
+        return proposed
 
     def _update_image_preview(self, image_path: str):
         """Update the image preview with the given path."""
@@ -870,40 +734,6 @@ class PropertiesPanel(ttk.Frame):
                     self._refresh_material_subcategories(widget, subcategory)
                     self._refresh_material_types(widget, material_type)
 
-    def _get_product_name(self) -> str:
-        """Get product name for the current diagram."""
-        try:
-            # For root component, use its name directly
-            if isinstance(self.current_shape, ComponentBox):
-                if self.current_shape.properties.get('node_type', '').lower() == 'root':
-                    name = self.current_shape.properties.get('name', '')
-                    return name if name else "Product"
-            
-            # For other shapes, try to get root product name from JSON repository
-            # Get the root_component_id
-            root_id = None
-            
-            if isinstance(self.current_shape, ComponentBox):
-                root_id = self.current_shape.properties.get('root_component_id')
-                if not root_id:
-                    # Try to get from db_id for root itself
-                    db_id = self.current_shape.properties.get('db_id')
-                    if db_id:
-                        component = self.repository.get_component(int(db_id))
-                        if component:
-                            root_id = component.get('root_component_id')
-            
-            # Get product name from JSON repository
-            if root_id:
-                product = self.repository.get_product(int(root_id))
-                if product:
-                    return product.get('name', 'Product')
-            
-            return "Product"
-            
-        except Exception:
-            return "Product"
-    
     def clear(self):
         """Clear the properties panel."""
         self.load_shape(None)

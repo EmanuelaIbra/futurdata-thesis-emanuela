@@ -22,13 +22,13 @@ class ImageHandler:
                      Defaults to ~/.disassembly_diagram/images/
         """
         if base_dir is None:
+            #app_dir = "D:/.disassembly_diagram"
             app_dir = os.path.join(os.path.expanduser("~"), ".disassembly_diagram")
             self.images_dir = os.path.join(app_dir, "images")
         else:
             self.images_dir = os.path.join(base_dir, "images")
         
-        # Create images directory if it doesn't exist
-        os.makedirs(self.images_dir, exist_ok=True)
+        # Path resolution and previews are read-only; upload creates directories.
     
     def upload_image(self, source_path: str, entity_type: str = "component", 
                     entity_id: Optional[int] = None, product_name: str = None, 

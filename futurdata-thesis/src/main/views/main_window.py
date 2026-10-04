@@ -2,6 +2,8 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from typing import Optional
 
+from ..utils.feedback import FeedbackType
+
 from .canvas_view import DiagramCanvas
 from .properties_panel import PropertiesPanel
 from .navigator import Navigator
@@ -180,8 +182,8 @@ class MainWindow:
         ttk.Button(palette_frame, text="▭ Root Component", command=lambda: self.controller.add_shape("component_root")).pack(fill="x", pady=2)
         ttk.Button(palette_frame, text="▭ Leaf Component", command=lambda: self.controller.add_shape("component_leaf")).pack(fill="x", pady=2)
         ttk.Button(palette_frame, text="▭ Composite Comp.", command=lambda: self.controller.add_shape("component_composite")).pack(fill="x", pady=2)
-        ttk.Button(palette_frame, text="○ Step", command=lambda: self.controller.add_shape("action")).pack(fill="x", pady=2)
-        ttk.Button(palette_frame, text="◇ Action", command=lambda: self.controller.add_shape("diamond")).pack(fill="x", pady=2)
+        ttk.Button(palette_frame, text="○ Action", command=lambda: self.controller.add_shape("action")).pack(fill="x", pady=2)
+        ttk.Button(palette_frame, text="◇ Step", command=lambda: self.controller.add_shape("diamond")).pack(fill="x", pady=2)
         ttk.Button(palette_frame, text="→ Arrow", command=lambda: self.controller.add_shape("arrow")).pack(fill="x", pady=2)
 
         canvas_frame = ttk.Frame(self.paned_window, width=200)
@@ -220,12 +222,13 @@ class MainWindow:
         """
         self.status_bar = ttk.Frame(self.root, relief="sunken")
         self.status_bar.pack(side="bottom", fill="x")
-
-        self.status_label = ttk.Label(self.status_bar, text="Ready", padding=(5, 2))
-        self.status_label.pack(side="left")
-
+        self.status_icon = ttk.Label(self.status_bar, padding=(5, 2))
+        self.status_icon.pack(side="left")
         self.shape_count_label = ttk.Label(self.status_bar, text="Shapes: 0", padding=(5, 2))
         self.shape_count_label.pack(side="right")
+        self.status_label = ttk.Label(self.status_bar, text="Ready", padding=(0, 2), anchor="w")
+        self.status_label.pack(side="left", fill="x", expand=True)
+        self.set_status("Ready")
 
     def _bind_shortcuts(self):
         """
@@ -317,14 +320,18 @@ class MainWindow:
         shape_count = len(self.controller.diagram.shapes)
         self.shape_count_label.config(text=f"Shapes: {shape_count}")
 
-    def set_status(self, message: str):
-        """
-        Updates the message logged inside the bottom-left status bar.
-
-        Args:
-            message (str): The execution status text summary to display.
-        """
-        self.status_label.config(text=message)
+    def set_status(self, message: str, feedback_type=FeedbackType.INFO):
+        """Set the complete visual state for each message, independent of prior feedback."""
+        feedback_type = FeedbackType(feedback_type)
+        colors = {
+            FeedbackType.SUCCESS: ("#176534", "✓"),
+            FeedbackType.ERROR: ("red", "✕"),
+            FeedbackType.INFO: ("black", ""),
+            FeedbackType.WARNING: ("#855600", "!"),
+        }
+        foreground, icon = colors[feedback_type]
+        self.status_label.configure(text=message, foreground=foreground)
+        self.status_icon.configure(text=icon, foreground=foreground)
 
     def update_properties_panel(self, shape=None):
         """
@@ -383,7 +390,7 @@ class MainWindow:
         Returns:
             Optional[str]: 'save' to confirm, 'discard' to ignore or 'cancel' to halt termination.
         """
-        result = messagebox.askyesnocancel("Unsaved Changes", "You have unsaved changes. Do you want to save them?")
+        result = messagebox.askyesnocancel("Unsaved Changes", "You have unsaved changes. Do you want to save them?", parent=self.root)
         if result is True:
             return 'save'
         elif result is False:
@@ -417,7 +424,7 @@ class MainWindow:
             title (str): The header string context title of the popup window.
             message (str): Explicit error summary log description.
         """
-        self.status_label.config(text=f"Error [{title}]: {message}", foreground="red")
+        self.set_status(f"Error [{title}]: {message}", FeedbackType.ERROR)
 
     def show_info(self, title: str, message: str):
         """
@@ -427,10 +434,43 @@ class MainWindow:
             title (str): The header string context title of the popup window.
             message (str): Core notice text description details.
         """
-        self.status_label.config(text=f"Info: {message}", foreground="black")
+        self.set_status(f"Info: {message}", FeedbackType.INFO)
     
     def update_snap_button(self, snap_enabled: bool):
         if snap_enabled:
             self.snap_btn.config(text="Snap to Grid: ON", relief=tk.SUNKEN, bg="#e0e0e0")
         else:
             self.snap_btn.config(text="Snap to Grid: OFF", relief=tk.RAISED, bg="#f0f0f0")
+
+    def show_shape_context_menu(self, event, edit, duplicate, delete):
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="Edit Properties", command=edit)
+        menu.add_separator()
+        menu.add_command(label="Duplicate", command=duplicate)
+        menu.add_command(label="Delete", command=delete)
+        menu.post(event.x_root, event.y_root)
+
+    def ask_confirmation(self, title, message):
+        return messagebox.askyesno(title, message, parent=self.root)
+
+    def show_workflow_error(self, title, message):
+        messagebox.showerror(title, message, parent=self.root)
+
+    def show_catalog_dialog(self, kind, controller, manage=False):
+        if manage:
+            from .manage_colors_dialog import ManageColorsDialog
+            from .manage_materials_dialog import ManageMaterialsDialog
+            from .manage_tools_dialog import ManageToolsDialog
+            dialogs = {'color': ManageColorsDialog, 'material': ManageMaterialsDialog,
+                       'tool': ManageToolsDialog}
+            dialogs[kind](self.root, controller)
+            return None
+        from .add_color_dialog import AddColorDialog
+        from .add_material_dialog import AddMaterialDialog
+        from .add_tool_dialog import AddToolDialog
+        dialogs = {'color': AddColorDialog, 'material': AddMaterialDialog, 'tool': AddToolDialog}
+        return dialogs[kind](self.root, controller).result
+
+    def show_product_list(self, controller, on_load):
+        from .product_list_dialog import ProductListDialog
+        ProductListDialog(self.root, controller, on_load)

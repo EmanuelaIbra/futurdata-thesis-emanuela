@@ -12,8 +12,6 @@ class Shape:
         self.y = y
         self.shape_type = shape_type
         self.text = ""
-        self.shape_id = None
-        self.text_id = None
         self.selected = False
 
     @classmethod
@@ -338,39 +336,49 @@ class ArrowShape(Shape):
         else:
             self.to_anchor = 'top' if dy > 0 else 'bottom'
 
-    def get_bounds(self) -> Tuple[float, float, float, float]:
+    def get_endpoints(self):
+        """Calculate logical endpoints without changing the arrow."""
         if self.from_shape and self.to_shape:
-            self.update_from_shapes()
+            dx = self.to_shape.x - self.from_shape.x
+            dy = self.to_shape.y - self.from_shape.y
+            if abs(dx) > abs(dy):
+                source, target = ('right', 'left') if dx > 0 else ('left', 'right')
+            else:
+                source, target = ('bottom', 'top') if dy > 0 else ('top', 'bottom')
+            return (self.from_shape.get_connection_points()[source],
+                    self.to_shape.get_connection_points()[target])
+        return (self.x, self.y), (self.end_x, self.end_y)
+
+    def get_bounds(self) -> Tuple[float, float, float, float]:
+        (x, y), (end_x, end_y) = self.get_endpoints()
         padding = 15
-        x1 = min(self.x, self.end_x) - padding
-        y1 = min(self.y, self.end_y) - padding
-        x2 = max(self.x, self.end_x) + padding
-        y2 = max(self.y, self.end_y) + padding
+        x1 = min(x, end_x) - padding
+        y1 = min(y, end_y) - padding
+        x2 = max(x, end_x) + padding
+        y2 = max(y, end_y) + padding
         return (x1, y1, x2, y2)
 
     def get_connection_points(self) -> Dict[str, Tuple[float, float]]:
-        if self.from_shape and self.to_shape:
-            self.update_from_shapes()
-        mid_x = (self.x + self.end_x) / 2
-        mid_y = (self.y + self.end_y) / 2
+        (x, y), (end_x, end_y) = self.get_endpoints()
+        mid_x = (x + end_x) / 2
+        mid_y = (y + end_y) / 2
         return {
             'top': (mid_x, mid_y - 20),
             'bottom': (mid_x, mid_y + 20),
-            'left': (self.x, self.y),
-            'right': (self.end_x, self.end_y)
+            'left': (x, y),
+            'right': (end_x, end_y)
         }
 
     def contains_point(self, px: float, py: float) -> bool:
-        if self.from_shape and self.to_shape:
-            self.update_from_shapes()
-        line_length_sq = (self.end_x - self.x) ** 2 + (self.end_y - self.y) ** 2
+        (x, y), (end_x, end_y) = self.get_endpoints()
+        line_length_sq = (end_x - x) ** 2 + (end_y - y) ** 2
         if line_length_sq == 0:
-            distance = math.sqrt((px - self.x) ** 2 + (py - self.y) ** 2)
+            distance = math.sqrt((px - x) ** 2 + (py - y) ** 2)
         else:
-            t = max(0, min(1, ((px - self.x) * (self.end_x - self.x) +
-                               (py - self.y) * (self.end_y - self.y)) / line_length_sq))
-            proj_x = self.x + t * (self.end_x - self.x)
-            proj_y = self.y + t * (self.end_y - self.y)
+            t = max(0, min(1, ((px - x) * (end_x - x) +
+                               (py - y) * (end_y - y)) / line_length_sq))
+            proj_x = x + t * (end_x - x)
+            proj_y = y + t * (end_y - y)
             distance = math.sqrt((px - proj_x) ** 2 + (py - proj_y) ** 2)
         return distance <= 10
 
